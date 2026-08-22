@@ -1,0 +1,1979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+<meta name="theme-color" content="#221C15" />
+<title>STANDBY — Theme Park Queue Log</title>
+<link rel="icon" href="data:,">
+<!-- Basic PWA manifest so it can be "added to home screen" like an app -->
+<link rel="manifest" href="data:application/manifest+json,{%22name%22:%22STANDBY%22,%22short_name%22:%22STANDBY%22,%22start_url%22:%22.%22,%22display%22:%22standalone%22,%22background_color%22:%22%23F1E6CE%22,%22theme_color%22:%22%23221C15%22}">
+<style>
+  html, body { margin: 0; padding: 0; background: #F1E6CE; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React + ReactDOM (UMD builds) -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<!-- Babel standalone compiles the JSX below in-browser. Fine for personal
+     use; a real build step (Vite, etc.) would be the next step up if this
+     ever needs to be fast/offline at scale. -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+
+<script>
+  // ---- localStorage-backed shim matching Claude's window.storage API ----
+  // Real, boring browser localStorage — tied to this exact URL/origin,
+  // survives closing the tab/browser, only clears if you clear site data.
+  window.storage = {
+    async get(key, shared) {
+      const ns = shared ? "shared:" : "personal:";
+      const raw = localStorage.getItem(ns + key);
+      if (raw === null) throw new Error("Key not found: " + key);
+      return { key, value: raw, shared: !!shared };
+    },
+    async set(key, value, shared) {
+      const ns = shared ? "shared:" : "personal:";
+      localStorage.setItem(ns + key, value);
+      return { key, value, shared: !!shared };
+    },
+    async delete(key, shared) {
+      const ns = shared ? "shared:" : "personal:";
+      localStorage.removeItem(ns + key);
+      return { key, deleted: true, shared: !!shared };
+    },
+    async list(prefix, shared) {
+      const ns = shared ? "shared:" : "personal:";
+      const full = ns + (prefix || "");
+      const keys = Object.keys(localStorage).filter((k) => k.startsWith(full)).map((k) => k.slice(ns.length));
+      return { keys, prefix, shared: !!shared };
+    },
+  };
+</script>
+
+<script type="text/babel" data-presets="react">
+  const { useState, useEffect, useMemo } = React;
+
+
+// ============================================================
+// Design tokens — mid-century modern: flat color blocking,
+// warm atomic-age palette, geometric shapes.
+// ============================================================
+const CREAM = "#F1E6CE";
+const CREAM_LINE = "#E3D3A8";
+const CHARCOAL = "#221C15";
+const INK = "#2B2318";
+const BURNT_ORANGE = "#D9702E";
+const TEAL = "#2E7D6B";
+const MUSTARD = "#E7A93E";
+const CORAL = "#C1443B";
+const PLUM = "#7B4B6E";
+const MUTED = "#8A7A5C";
+
+const FONT_LINK_ID = "standby-fonts";
+function useGoogleFonts() {
+  useEffect(() => {
+    if (document.getElementById(FONT_LINK_ID)) return;
+    const link = document.createElement("link");
+    link.id = FONT_LINK_ID;
+    link.rel = "stylesheet";
+    link.href =
+      "https://fonts.googleapis.com/css2?family=Poppins:wght@600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap";
+    document.head.appendChild(link);
+  }, []);
+}
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+function fmtClock(totalSeconds) {
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = Math.floor(totalSeconds % 60);
+  const pad = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+function fmtMinutes(mins) {
+  if (mins == null) return "—";
+  if (mins < 1) return "<1 min";
+  if (mins < 60) return `${Math.round(mins)} min`;
+  const h = Math.floor(mins / 60);
+  const m = Math.round(mins % 60);
+  return `${h}h ${m}m`;
+}
+function fmtDateStr(dateStr) {
+  const d = new Date(dateStr + "T12:00:00");
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+}
+function fmtDateShort(dateStr) {
+  const d = new Date(dateStr + "T12:00:00");
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+function fmtTime(iso) {
+  return new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+function norm(s) {
+  return (s || "").trim().toLowerCase();
+}
+function hashString(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+// ---- Geolocation ----
+function getPosition() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) { reject(new Error("Location isn't available in this browser.")); return; }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+      (err) => reject(new Error(err.message || "Couldn't get your location.")),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+    );
+  });
+}
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+function fmtDistance(meters) {
+  if (meters < 300) return `${Math.round(meters)} m`;
+  return `${(meters / 1000).toFixed(2)} km`;
+}
+// High-confidence park entrance coordinates only — used for coarse
+// "which park am I at" detection. Ride-level detection is self-calibrated
+// (see the pin feature) rather than guessed, since ride-level GPS data
+// isn't something reliably knowable ahead of time.
+const PARK_COORDS = {
+  "magic kingdom": { lat: 28.4177, lng: -81.5812 },
+  "epcot": { lat: 28.3747, lng: -81.5494 },
+  "disney's hollywood studios": { lat: 28.3573, lng: -81.5605 },
+  "disney's animal kingdom": { lat: 28.3553, lng: -81.5901 },
+  "disneyland park": { lat: 33.8121, lng: -117.9190 },
+  "disney california adventure": { lat: 33.8078, lng: -117.9190 },
+  "universal studios florida": { lat: 28.4749, lng: -81.4677 },
+  "islands of adventure": { lat: 28.4711, lng: -81.4693 },
+  "universal studios hollywood": { lat: 34.1381, lng: -118.3534 },
+  "knott's berry farm": { lat: 33.8452, lng: -117.9987 },
+};
+
+// ---- Passport stamp icon/rotation helpers ----
+function stampRotation(name) {
+  return (hashString(name) % 17) - 8;
+}
+const STAMP_ICON_RULES = [
+  [/mountain|matterhorn|everest|thunder/, "⛰️"],
+  [/space|galax|cosmic|astro|orbit/, "🚀"],
+  [/pirate/, "☠️"],
+  [/haunted|ghost|mansion/, "👻"],
+  [/water|river|rapids|splash|soak|falls|voyage|drift/, "💧"],
+  [/dragon/, "🐉"],
+  [/train|railroad|railway|express/, "🚂"],
+  [/boat|ship|riverboat/, "⛵"],
+  [/coaster/, "🎢"],
+  [/carousel|carrousel/, "🎠"],
+  [/wheel|ferris/, "🎡"],
+  [/tea party|teacup/, "🍵"],
+  [/balloon/, "🎈"],
+  [/jungle|safari/, "🌴"],
+  [/dino|jurassic/, "🦕"],
+  [/harry potter|wizard|hogwarts|hippogriff|magic/, "🪄"],
+  [/hero|marvel|avengers|guardians/, "🦸"],
+  [/mermaid/, "🧜"],
+  [/frozen/, "❄️"],
+  [/nemo|submarine/, "🐠"],
+  [/mine|mining/, "⛏️"],
+  [/toy story/, "🤠"],
+  [/monster/, "👹"],
+  [/minion/, "🍌"],
+  [/simpsons/, "🍩"],
+  [/transformers/, "🤖"],
+  [/mario|nintendo|bowser|yoshi/, "🍄"],
+  [/bear|grizzly/, "🐻"],
+  [/bird|owl|hippogriff|griffin/, "🦜"],
+  [/firework|spectacular|color|fantasmic/, "🎆"],
+  [/spider/, "🕷️"],
+  [/hulk/, "💚"],
+  [/pooh/, "🍯"],
+];
+function stampIcon(name, type) {
+  const n = norm(name);
+  for (const [re, icon] of STAMP_ICON_RULES) if (re.test(n)) return icon;
+  return type === "show" ? "🎭" : "🎫";
+}
+const STAMP_INKS = [BURNT_ORANGE, TEAL, CORAL, PLUM, "#B8892E"];
+function stampInk(name) {
+  return STAMP_INKS[hashString(name) % STAMP_INKS.length];
+}
+
+const LINE_TYPES = [
+  { id: "standby", label: "Standby", short: "Standby", color: TEAL },
+  { id: "lightning_lane", label: "Lightning Lane / FastPass", short: "Lightning Lane", color: PLUM },
+  { id: "single_rider", label: "Single Rider", short: "Single Rider", color: BURNT_ORANGE },
+];
+function lineTypeMeta(id) {
+  return LINE_TYPES.find((t) => t.id === id) || LINE_TYPES[0];
+}
+
+// ============================================================
+// Owners (alphabetical, ignoring leading "The"; Other pinned last)
+// ============================================================
+const OWNERS = [
+  "Compagnie des Alpes",
+  "Efteling",
+  "Europa-Park",
+  "Gilroy Gardens Family Theme Park",
+  "Herschend Family Entertainment",
+  "Hershey Entertainment & Resorts Company",
+  "Merlin Entertainments",
+  "Phantasialand",
+  "Plopsa",
+  "PortAventura World",
+  "SeaWorld Parks & Entertainment",
+  "Six Flags Entertainment Corporation",
+  "Tivoli A/S",
+  "Universal Parks & Resorts",
+  "The Walt Disney Company",
+  "Warner Bros. Discovery Global Experiences",
+  "Other",
+];
+
+// ============================================================
+// Seed catalog: owner -> resort -> park -> land -> [{name,type}]
+// Rides listed by land, alphabetized for display at lookup time.
+// ============================================================
+const r = (name) => ({ name, type: "ride" });
+const s = (name) => ({ name, type: "show" });
+
+const CATALOG = {
+  "The Walt Disney Company": {
+    "Walt Disney World Resort": {
+      "Magic Kingdom": {
+        "Main Street, U.S.A.": [r("Walt Disney World Railroad")],
+        "Adventureland": [r("Pirates of the Caribbean"), r("Jungle Cruise"), r("The Magic Carpets of Aladdin"), s("Walt Disney's Enchanted Tiki Room"), r("Swiss Family Treehouse")],
+        "Frontierland": [r("Big Thunder Mountain Railroad"), r("Tiana's Bayou Adventure"), s("Country Bear Jamboree")],
+        "Liberty Square": [r("Haunted Mansion"), r("Liberty Square Riverboat"), s("The Hall of Presidents")],
+        "Fantasyland": [r("Seven Dwarfs Mine Train"), r("Peter Pan's Flight"), r("It's a Small World"), r("Mad Tea Party"), r("Prince Charming Regal Carrousel"), r("Under the Sea: Journey of the Little Mermaid"), s("Mickey's PhilharMagic"), r("Dumbo the Flying Elephant"), r("The Barnstormer")],
+        "Tomorrowland": [r("Space Mountain"), r("Buzz Lightyear's Space Ranger Spin"), r("TRON Lightcycle / Run"), r("Tomorrowland Speedway"), r("Astro Orbiter"), s("Monsters, Inc. Laugh Floor"), s("Walt Disney's Carousel of Progress")],
+      },
+      "EPCOT": {
+        "World Celebration": [r("Spaceship Earth")],
+        "World Discovery": [r("Guardians of the Galaxy: Cosmic Rewind"), r("Test Track"), r("Mission: SPACE")],
+        "World Nature": [r("Living with the Land"), r("Soarin' Around the World"), r("The Seas with Nemo & Friends")],
+        "World Showcase": [r("Frozen Ever After"), r("Gran Fiesta Tour Starring The Three Caballeros"), r("Remy's Ratatouille Adventure"), s("Impressions de France"), s("Reflections of China"), s("The American Adventure"), s("Canada Far and Wide")],
+      },
+      "Disney's Hollywood Studios": {
+        "Echo Lake": [r("Star Tours – The Adventures Continue"), s("Indiana Jones Epic Stunt Spectacular")],
+        "Toy Story Land": [r("Slinky Dog Dash"), r("Toy Story Mania!"), r("Alien Swirling Saucers")],
+        "Star Wars: Galaxy's Edge": [r("Star Wars: Rise of the Resistance"), r("Millennium Falcon: Smugglers Run")],
+        "Sunset Boulevard": [r("The Twilight Zone Tower of Terror"), r("Rock 'n' Roller Coaster"), s("Fantasmic!")],
+        "Grand Avenue": [s("Muppet*Vision 3D")],
+      },
+      "Disney's Animal Kingdom": {
+        "Pandora – The World of Avatar": [r("Avatar Flight of Passage"), r("Na'vi River Journey")],
+        "Africa": [r("Kilimanjaro Safaris"), s("Festival of the Lion King")],
+        "Asia": [r("Expedition Everest"), r("Kali River Rapids"), s("Feathered Friends in Flight")],
+        "DinoLand U.S.A.": [r("DINOSAUR"), r("TriceraTop Spin")],
+      },
+    },
+    "Disneyland Resort": {
+      "Disneyland Park": {
+        "Main Street, U.S.A.": [r("Disneyland Railroad (Main Street Station)"), r("Main Street Vehicles"), s("Main Street Cinema"), s("The Disney Gallery"), s("Walt Disney – A Magical Life"), s("Great Moments with Mr. Lincoln")],
+        "Adventureland": [r("Jungle Cruise"), r("Indiana Jones Adventure"), s("Walt Disney's Enchanted Tiki Room"), r("Adventureland Treehouse inspired by Walt Disney's Swiss Family Robinson")],
+        "New Orleans Square": [r("Pirates of the Caribbean"), r("Haunted Mansion"), r("Haunted Mansion Holiday"), s("Fantasmic!"), r("Disneyland Railroad (New Orleans Square Station)")],
+        "Bayou Country": [r("The Many Adventures of Winnie the Pooh"), r("Davy Crockett's Explorer Canoes")],
+        "Star Wars: Galaxy's Edge": [r("Star Wars: Rise of the Resistance"), r("Millennium Falcon: Smugglers Run")],
+        "Frontierland": [r("Big Thunder Mountain Railroad"), r("Mark Twain Riverboat"), r("Sailing Ship Columbia"), r("Pirate's Lair on Tom Sawyer Island")],
+        "Mickey's Toontown": [r("Mickey & Minnie's Runaway Railway"), r("Roger Rabbit's Car Toon Spin"), r("Chip 'n' Dale's GADGETcoaster"), r("CenTOONial Park"), r("Donald's Duck Pond"), r("Goofy's How-to-Play Yard")],
+        "Fantasyland": [r("Alice in Wonderland"), r("Casey Jr. Circus Train"), r("Dumbo the Flying Elephant"), r("King Arthur Carrousel"), r("Mad Tea Party"), r("Matterhorn Bobsleds"), r("Mr. Toad's Wild Ride"), r("Peter Pan's Flight"), r("Pinocchio's Daring Journey"), r("Snow White's Enchanted Wish"), r("Sleeping Beauty Castle Walkthrough"), r("Storybook Land Canal Boats"), r("it's a small world"), r("it's a small world Holiday")],
+        "Tomorrowland": [r("Autopia"), r("Astro Orbitor"), r("Buzz Lightyear Astro Blasters"), r("Disneyland Monorail"), r("Finding Nemo Submarine Voyage"), r("Space Mountain"), r("Star Tours – The Adventures Continue")],
+      },
+      "Disney California Adventure": {
+        "Buena Vista Street": [s("Five & Dime"), { name: "Meet Disney Pals on Buena Vista Street", type: "show", writeIn: true }],
+        "Hollywood Land": [r("Monsters, Inc. Mike & Sulley to the Rescue!"), s("Mickey's PhilharMagic"), s("Disney Jr. Mickey Mouse Clubhouse Live!"), s("Animation Academy"), s("Anna & Elsa's Royal Welcome"), s("Guardians of the Galaxy: Awesome Dance Off!"), s("Turtle Talk with Crush")],
+        "Avengers Campus": [r("Guardians of the Galaxy – Mission: BREAKOUT!"), r("WEB SLINGERS: A Spider-Man Adventure"), s("Ancient Sanctum (Marvel Meet and Greets)")],
+        "Cars Land": [r("Radiator Springs Racers"), r("Luigi's Rollickin' Roadsters"), r("Luigi's Joy to the Whirl"), r("Mater's Junkyard Jamboree"), r("Mater's Jingle Jamboree")],
+        "San Fransokyo Square": [r("The Bakery Tour")],
+        "Pixar Pier": [r("Incredicoaster"), r("Toy Story Midway Mania!"), r("Pixar Pal-A-Round"), r("Inside Out Emotional Whirlwind"), s("Games of Pixar Pier"), { name: "Meet the Residents of Radiator Springs", type: "show", writeIn: true }],
+        "Paradise Gardens Park": [r("Goofy's Sky School"), r("Golden Zephyr"), r("Jumpin' Jellyfish"), r("Silly Symphony Swings"), r("The Little Mermaid – Ariel's Undersea Adventure"), s("World of Color (nighttime spectacular)"), s("Mirabel's Gifts of the Season"), s("Mulan's Lunar New Year Procession"), s("The Storytellers of Plaza de la Familia Celebrate The Musical World of Coco!")],
+        "Grizzly Peak": [r("Soarin' Around the World"), r("Soarin' Across America"), r("Soarin' Over California"), r("Grizzly River Run"), r("Redwood Creek Challenge Trail")],
+      },
+    },
+    "Disneyland Paris": { "Disneyland Park (Paris)": {}, "Walt Disney Studios Park": {} },
+    "Tokyo Disney Resort": { "Tokyo Disneyland": {}, "Tokyo DisneySea": {} },
+    "Hong Kong Disneyland Resort": { "Hong Kong Disneyland": {} },
+    "Shanghai Disney Resort": { "Shanghai Disneyland": {} },
+  },
+  "Universal Parks & Resorts": {
+    "Universal Orlando Resort": {
+      "Universal Studios Florida": {
+        "Hollywood": [s("Universal Orlando's Horror Make-Up Show"), s("Animal Actors on Location"), s("The Bourne Stuntacular")],
+        "Production Central": [r("Despicable Me Minion Mayhem"), r("Transformers: The Ride-3D")],
+        "New York": [r("Race Through New York Starring Jimmy Fallon"), r("Revenge of the Mummy")],
+        "San Francisco": [r("Fast & Furious: Hollywood Drift")],
+        "World Expo / Springfield": [r("MEN IN BLACK Alien Attack"), r("The Simpsons Ride"), r("Kang & Kodos' Twirl 'n' Hurl")],
+        "Illumination's Minion Land": [r("Illumination's Villain-Con Minion Blast")],
+        "DreamWorks Land": [r("Trolls Trollercoaster"), r("Po's Kung Fu Training Camp"), s("Shrek's Swamp Meet"), s("DreamWorks Imagination Celebration")],
+        "Diagon Alley": [r("Harry Potter and the Escape from Gringotts"), r("Hogwarts Express (to Islands of Adventure)")],
+      },
+      "Islands of Adventure": {
+        "Port of Entry": [s("Port of Entry Christmas Music Fountain (seasonal entertainment)")],
+        "Marvel Super Hero Island": [r("The Incredible Hulk Coaster"), r("The Amazing Adventures of Spider-Man"), r("Doctor Doom's Fearfall"), r("Storm Force Accelatron")],
+        "Toon Lagoon": [r("Dudley Do-Right's Ripsaw Falls"), r("Popeye & Bluto's Bilge-Rat Barges"), r("Me Ship, The Olive")],
+        "Skull Island": [r("Skull Island: Reign of Kong")],
+        "Jurassic Park": [r("Jurassic World VelociCoaster"), r("Jurassic Park River Adventure"), r("Pteranodon Flyers"), r("Camp Jurassic"), s("Jurassic Park Discovery Center")],
+        "The Wizarding World of Harry Potter – Hogsmeade": [r("Harry Potter and the Forbidden Journey"), r("Flight of the Hippogriff"), r("Hogwarts Express")],
+        "Seuss Landing": [r("The Cat in the Hat"), r("Caro-Seuss-el"), r("One Fish, Two Fish, Red Fish, Blue Fish"), r("The High in the Sky Seuss Trolley Train Ride!"), r("If I Ran the Zoo"), s("Oh! The Stories You'll Hear!")],
+        "The Lost Continent": [s("The Mystic Fountain")],
+      },
+      "Epic Universe": {
+        "Celestial Park": [r("Stardust Racers"), r("Constellation Carousel"), r("Astronomica")],
+        "Super Nintendo World": [r("Mario Kart: Bowser's Challenge"), r("Mine-Cart Madness"), r("Yoshi's Adventure"), r("Bowser Jr. Shadow Showdown / Challenge")],
+        "Dark Universe": [r("Monsters Unchained: The Frankenstein Experiment"), r("Curse of the Werewolf")],
+        "How to Train Your Dragon – Isle of Berk": [r("Hiccup's Wing Gliders"), r("Fyre Drill"), r("Dragon Racer's Rally"), r("Viking Training Camp"), s("The Untrainable Dragon")],
+        "Wizarding World – Ministry of Magic": [r("Harry Potter and the Battle at the Ministry"), s("Le Cirque Arcanus")],
+      },
+    },
+    "Universal Studios Hollywood": {
+      "Universal Studios Hollywood": {
+        "Hollywood": [r("The Secret Life of Pets: Off the Leash"), s("Universal Animal Actors"), s("The Bourne Stuntacular"), s("DreamWorks Theatre featuring Kung Fu Panda")],
+        "Studio Tour": [r("World-Famous Studio Tour")],
+        "The Wizarding World of Harry Potter": [r("Harry Potter and the Forbidden Journey"), r("Flight of the Hippogriff")],
+        "Springfield": [r("The Simpsons Ride")],
+        "Illumination's Minion Land": [r("Despicable Me Minion Mayhem"), r("Super Silly Fun Land")],
+        "Jurassic World": [r("Jurassic World – The Ride")],
+        "Transformers Metrobase": [r("Transformers: The Ride-3D")],
+        "Super Nintendo World": [r("Mario Kart: Bowser's Challenge")],
+        "WaterWorld": [s("WaterWorld Stunt Show")],
+      },
+    },
+    "Universal Studios Japan": { "Universal Studios Japan": {} },
+    "Universal Beijing Resort": { "Universal Studios Beijing": {} },
+  },
+  "Six Flags Entertainment Corporation": {
+    "Six Flags Magic Mountain": { "Six Flags Magic Mountain": {} },
+    "Six Flags Great Adventure": { "Six Flags Great Adventure": {} },
+    "Six Flags Over Georgia": { "Six Flags Over Georgia": {} },
+    "Six Flags Over Texas": { "Six Flags Over Texas": {} },
+    "Six Flags St. Louis": { "Six Flags St. Louis": {} },
+    "Six Flags Fiesta Texas": { "Six Flags Fiesta Texas": {} },
+    "Six Flags Discovery Kingdom": { "Six Flags Discovery Kingdom": {} },
+    "Six Flags Great America": { "Six Flags Great America": {} },
+    "Six Flags America": { "Six Flags America": {} },
+    "Six Flags New England": { "Six Flags New England": {} },
+    "Knott's Berry Farm": {
+      "Knott's Berry Farm": {
+        "Ghost Town": [r("Calico Mine Ride"), r("Calico Railroad"), r("GhostRider"), r("Timber Mountain Log Ride"), r("Butterfield Stagecoach"), r("Pony Express"), s("Ghost Town Alive! (seasonal)"), s("Bird Cage Theatre"), s("Mystery Lodge (when operating)")],
+        "Fiesta Village": [r("MonteZOOMa: The Forbidden Fortress"), r("Jaguar!"), r("Sol Spin"), r("La Revolución"), r("Dragon Swing"), r("Hat Dance")],
+        "The Boardwalk": [r("Knott's Bear-y Tales: Return to the Fair"), r("Xcelerator"), r("HangTime"), r("Coast Rider"), r("Sierra Sidewinder"), r("Pacific Scrambler"), r("Surfside Gliders"), r("Sky Cabin")],
+        "Camp Snoopy": [r("Beagle Express"), r("Camp Bus"), r("Charlie Brown's Kite Flyer"), r("Grand Sierra Railroad"), r("High Sierra Ferris Wheel"), r("Linus Launcher"), r("Pig Pen's Mud Buggies"), r("Rapid River Run"), r("Rocky Mountain Trucking Company"), r("Snoopy's Tenderpaw Twister Coaster"), r("Woodstock's Airmail"), r("Woodstock's Cabin"), s("Camp Snoopy Theater")],
+      },
+    },
+  },
+  "Merlin Entertainments": {
+    "Alton Towers": { "Alton Towers": {} },
+    "Thorpe Park": { "Thorpe Park": {} },
+    "Chessington World of Adventures": { "Chessington World of Adventures": {} },
+    "Legoland California Resort": { "Legoland California": {} },
+    "Legoland Florida Resort": { "Legoland Florida": {} },
+    "Legoland Windsor Resort": { "Legoland Windsor": {} },
+  },
+  "SeaWorld Parks & Entertainment": {
+    "SeaWorld Orlando": { "SeaWorld Orlando": {} },
+    "SeaWorld San Diego": { "SeaWorld San Diego": {} },
+    "SeaWorld San Antonio": { "SeaWorld San Antonio": {} },
+    "Busch Gardens Tampa Bay": { "Busch Gardens Tampa Bay": {} },
+    "Busch Gardens Williamsburg": { "Busch Gardens Williamsburg": {} },
+  },
+  "Warner Bros. Discovery Global Experiences": {
+    "Warner Bros. World Abu Dhabi": { "Warner Bros. World Abu Dhabi": {} },
+    "Warner Bros. Studio Tour London": { "Warner Bros. Studio Tour London – The Making of Harry Potter": {} },
+    "Warner Bros. Studio Tour Hollywood": { "Warner Bros. Studio Tour Hollywood": {} },
+  },
+  "Herschend Family Entertainment": {
+    "Dollywood": { "Dollywood": {} },
+    "Silver Dollar City": { "Silver Dollar City": {} },
+  },
+  "Europa-Park": { "Europa-Park": { "Europa-Park": {} } },
+  "Tivoli A/S": { "Tivoli Gardens": { "Tivoli Gardens": {} } },
+  "Compagnie des Alpes": {
+    "Parc Astérix": { "Parc Astérix": {} },
+    "Walibi Rhône-Alpes": { "Walibi Rhône-Alpes": {} },
+  },
+  "PortAventura World": {
+    "PortAventura World": { "PortAventura Park": {}, "Ferrari Land": {} },
+  },
+  "Hershey Entertainment & Resorts Company": { "Hersheypark": { "Hersheypark": {} } },
+  "Efteling": { "Efteling": { "Efteling": {} } },
+  "Plopsa": {
+    "Plopsaland De Panne": { "Plopsaland De Panne": {} },
+    "Plopsa Coo": { "Plopsa Coo": {} },
+  },
+  "Phantasialand": { "Phantasialand": { "Phantasialand": {} } },
+  "Gilroy Gardens Family Theme Park": { "Gilroy Gardens": { "Gilroy Gardens": {} } },
+  "Other": {},
+};
+
+// ============================================================
+// Predefined challenges (US parks). Users can add their own.
+// ============================================================
+const BUILT_IN_CHALLENGES = [
+  { id: "mtn-mk", name: "The Mountaineer", emoji: "⛰️", park: "Magic Kingdom", description: "Ride every mountain at Magic Kingdom.", attractions: ["Space Mountain", "Big Thunder Mountain Railroad", "Tiana's Bayou Adventure"] },
+  { id: "mtn-dl", name: "The Mountaineer", emoji: "⛰️", park: "Disneyland Park", description: "Ride every mountain at Disneyland Park.", attractions: ["Space Mountain", "Big Thunder Mountain Railroad", "Matterhorn Bobsleds"] },
+  { id: "opening-day-dl", name: "Opening Day Original", emoji: "🎪", park: "Disneyland Park", description: "Ride the handful of attractions still running since Disneyland's 1955 opening day.", attractions: ["Jungle Cruise", "Peter Pan's Flight", "Mad Tea Party", "King Arthur Carrousel"] },
+  { id: "wand-bearer", name: "Wand Bearer", emoji: "⚡", park: "Islands of Adventure", description: "Experience every ride in the Wizarding World of Harry Potter – Hogsmeade.", attractions: ["Harry Potter and the Forbidden Journey", "Flight of the Hippogriff", "Hogwarts Express"] },
+  { id: "thrill-seeker-ioa", name: "Thrill Seeker", emoji: "🎢", park: "Islands of Adventure", description: "Ride the biggest coasters at Islands of Adventure.", attractions: ["Jurassic World VelociCoaster", "The Incredible Hulk Coaster", "Doctor Doom's Fearfall"] },
+  { id: "assembled", name: "Assembled", emoji: "🦸", park: "Disney California Adventure", description: "Complete every ride in Avengers Campus.", attractions: ["WEB SLINGERS: A Spider-Man Adventure", "Guardians of the Galaxy – Mission: BREAKOUT!"] },
+  { id: "world-traveler", name: "World Traveler", emoji: "🌍", park: "EPCOT", description: "Ride every attraction in World Showcase.", attractions: ["Frozen Ever After", "Gran Fiesta Tour Starring The Three Caballeros", "Remy's Ratatouille Adventure"] },
+];
+
+// ============================================================
+// Ride-count milestones
+// ============================================================
+const MILESTONE_TIERS = [1, 5, 10, 20, 50, 75, 100, 500, 750, 1000, 3500, 5000, 10000];
+const TIER_EMOJI = { 1: "🎫", 5: "🌱", 10: "🔁", 20: "🔥", 50: "⭐", 75: "🌟", 100: "💯", 500: "🏅", 750: "🎖️", 1000: "👑", 3500: "💎", 5000: "🏆", 10000: "♾️" };
+const GENERIC_TIER_NAMES = {
+  1: "First Ride", 5: "Getting Started", 10: "Regular", 20: "Frequent Rider", 50: "Devotee",
+  75: "Superfan", 100: "Century Club", 500: "500 Club", 750: "750 Club", 1000: "Thousand Club",
+  3500: "3,500 Club", 5000: "5K Club", 10000: "10K Legend",
+};
+const CURATED_MILESTONES = {
+  "matterhorn bobsleds": { 1: "First Ascent", 5: "Alpine Novice", 10: "Alpine Regular", 20: "Slope Veteran", 50: "Bobsled Regular", 75: "Yeti Whisperer", 100: "Summit Master", 500: "Matterhorn Legend", 750: "Ice Cave Elder", 1000: "King of the Matterhorn", 3500: "Eternal Summit", 5000: "Matterhorn Immortal", 10000: "The Mountain Itself" },
+  "mark twain riverboat": { 1: "First Voyage", 5: "Deckhand", 10: "First Mate", 20: "River Regular", 50: "Riverboat Regular", 75: "Paddlewheel Pro", 100: "Steamboat Captain", 500: "River Legend", 750: "Mississippi Master", 1000: "Admiral of the Rivers of America", 3500: "Eternal Captain", 5000: "Riverboat Immortal", 10000: "The River Itself" },
+  "spaceship earth": { 1: "First Orbit", 5: "Curious Traveler", 10: "History Buff", 20: "Time Tunneler", 50: "Future Thinker", 75: "Geosphere Regular", 100: "Progress Tech School of Urban Planning Graduate", 500: "EPCOT Futurist", 750: "Golden Geode Scholar", 1000: "Spaceship Earth Sage", 3500: "Eternal Optimist", 5000: "Spaceship Earth Immortal", 10000: "The Sphere Itself" },
+  "space mountain": { 1: "First Launch", 5: "Cadet", 10: "Astronaut in Training", 20: "Space Ranger", 50: "Star Voyager", 75: "Cosmic Regular", 100: "Galactic Century Club", 500: "Space Mountain Legend", 750: "Nebula Elder", 1000: "Commander of Tomorrowland", 3500: "Eternal Orbiter", 5000: "Space Mountain Immortal", 10000: "The Mountain Beyond" },
+  "big thunder mountain railroad": { 1: "First Run", 5: "Prospector", 10: "Trail Regular", 20: "Wildest Ride Regular", 50: "Runaway Regular", 75: "Mine Cart Veteran", 100: "Big Thunder Century Club", 500: "Big Thunder Legend", 750: "Deepest Mine Elder", 1000: "Foreman of Big Thunder", 3500: "Eternal Prospector", 5000: "Big Thunder Immortal", 10000: "The Mountain's Own" },
+  "pirates of the caribbean": { 1: "First Plunder", 5: "Deckhand", 10: "Buccaneer", 20: "Privateer", 50: "Seasoned Sailor", 75: "Salty Sea Dog", 100: "Pirate Captain", 500: "Pirate Legend", 750: "Scourge of the Seven Seas", 1000: "Pirate King", 3500: "Eternal Corsair", 5000: "Pirates Immortal", 10000: "Davy Jones Himself" },
+  "haunted mansion": { 1: "First Séance", 5: "Foolish Mortal", 10: "Ghost Host Regular", 20: "Grim Grinning Regular", 50: "Séance Circle Regular", 75: "Hitchhiking Ghost's Friend", 100: "Master of Ceremonies", 500: "Haunted Mansion Legend", 750: "Resident Spirit", 1000: "The 1,000th Ghost", 3500: "Eternal Resident", 5000: "Haunted Mansion Immortal", 10000: "The 999th Happy Haunt" },
+};
+function milestoneName(attractionName, tier) {
+  return CURATED_MILESTONES[norm(attractionName)]?.[tier] || GENERIC_TIER_NAMES[tier];
+}
+
+// ============================================================
+// Catalog helpers
+// ============================================================
+function mergeCatalog(seed, custom) {
+  const result = JSON.parse(JSON.stringify(seed));
+  for (const owner in custom) {
+    result[owner] = result[owner] || {};
+    for (const resort in custom[owner]) {
+      result[owner][resort] = result[owner][resort] || {};
+      for (const park in custom[owner][resort]) {
+        result[owner][resort][park] = result[owner][resort][park] || {};
+        for (const land in custom[owner][resort][park]) {
+          result[owner][resort][park][land] = result[owner][resort][park][land] || [];
+          for (const attr of custom[owner][resort][park][land]) {
+            if (!result[owner][resort][park][land].some((a) => norm(a.name) === norm(attr.name))) {
+              result[owner][resort][park][land].push(attr);
+            }
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+function sortedOwners() {
+  return OWNERS.slice().sort((a, b) => {
+    const ka = a.replace(/^The\s+/i, "");
+    const kb = b.replace(/^The\s+/i, "");
+    if (a === "Other") return 1;
+    if (b === "Other") return -1;
+    return ka.localeCompare(kb);
+  });
+}
+function getResorts(catalog, owner) {
+  return Object.keys(catalog[owner] || {}).sort((a, b) => a.localeCompare(b));
+}
+function getParks(catalog, owner, resort) {
+  const parks = catalog[owner]?.[resort] || {};
+  const names = Object.keys(parks);
+  // Defensive: drop a stray park entry that exactly matches the resort's own
+  // name and has no lands — a leftover pattern from an older bug where
+  // starting a visit could accidentally register the resort as its own park.
+  const cleaned = names.filter((name) => {
+    if (names.length <= 1) return true;
+    const selfNamed = norm(name) === norm(resort);
+    const empty = !parks[name] || Object.keys(parks[name]).length === 0;
+    return !(selfNamed && empty);
+  });
+  return cleaned.sort((a, b) => a.localeCompare(b));
+}
+function getAllAttractionsForPark(catalog, owner, resort, park) {
+  const lands = catalog[owner]?.[resort]?.[park] || {};
+  const out = [];
+  for (const land of Object.keys(lands)) {
+    for (const attr of lands[land]) out.push({ ...attr, land });
+  }
+  return out;
+}
+function getGroupedAttractionsForPark(catalog, owner, resort, park) {
+  const lands = catalog[owner]?.[resort]?.[park] || {};
+  return Object.keys(lands)
+    .sort((a, b) => a.localeCompare(b))
+    .map((land) => ({ land, items: lands[land].slice().sort((a, b) => a.name.localeCompare(b.name)) }))
+    .filter((g) => g.items.length > 0);
+}
+function findAttractionInPark(catalog, owner, resort, park, name) {
+  return getAllAttractionsForPark(catalog, owner, resort, park).find((a) => norm(a.name) === norm(name));
+}
+function knownAttractionCountForPark(catalog, owner, resort, park) {
+  const lands = catalog[owner]?.[resort]?.[park];
+  if (!lands || Object.keys(lands).length === 0) return null;
+  return getAllAttractionsForPark(catalog, owner, resort, park).length;
+}
+function allAttractionParkPairs(catalog, records) {
+  const map = new Map();
+  for (const owner in catalog) {
+    for (const resort in catalog[owner]) {
+      for (const park in catalog[owner][resort]) {
+        for (const attr of getAllAttractionsForPark(catalog, owner, resort, park)) {
+          const key = `${norm(attr.name)}||${norm(park)}`;
+          if (!map.has(key)) map.set(key, { attraction: attr.name, park });
+        }
+      }
+    }
+  }
+  for (const rec of records) {
+    const key = `${norm(rec.attraction)}||${norm(rec.park)}`;
+    if (!map.has(key)) map.set(key, { attraction: rec.attraction, park: rec.park });
+  }
+  return Array.from(map.values()).sort((a, b) => a.attraction.localeCompare(b.attraction));
+}
+
+// ============================================================
+// CSV export
+// ============================================================
+function toCSVField(val) {
+  const s2 = String(val ?? "");
+  if (/[",\n]/.test(s2)) return `"${s2.replace(/"/g, '""')}"`;
+  return s2;
+}
+function recordsToCSV(records) {
+  const header = ["visit_date", "owner", "resort", "park", "land", "attraction", "type", "line_type", "outcome", "broke_down", "note", "met", "entered_line_at", "boarded_at", "actual_wait_minutes", "posted_wait_minutes", "difference_minutes"];
+  const rows = records.map((rec) => {
+    const diff = rec.postedWait != null && rec.postedWait !== "" ? Math.round(rec.waitMinutes - rec.postedWait) : "";
+    return [
+      rec.date, rec.owner, rec.resort, rec.park, rec.land || "", rec.attraction, rec.type,
+      lineTypeMeta(rec.lineType).short, rec.outcome === "left" ? "Left line" : "Boarded", rec.brokeDown ? "Yes" : "No", rec.note || "", rec.meetDetail || "",
+      new Date(rec.startTime).toLocaleString(), new Date(rec.endTime).toLocaleString(),
+      Math.round(rec.waitMinutes), rec.postedWait != null && rec.postedWait !== "" ? rec.postedWait : "", diff,
+    ].map(toCSVField).join(",");
+  });
+  return [header.join(","), ...rows].join("\n");
+}
+function downloadCSV(records, filename) {
+  const csv = recordsToCSV(records);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ============================================================
+// Small shared UI
+// ============================================================
+const inputStyle = {
+  width: "100%",
+  padding: "13px 14px",
+  border: `1.5px solid ${CREAM_LINE}`,
+  borderRadius: 8,
+  fontSize: 15,
+  background: "#FFFFFF",
+  color: INK,
+};
+
+function Field({ label, children, hint }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={{ display: "block", fontSize: 11.5, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: MUTED, marginBottom: 6 }}>
+        {label}
+      </label>
+      {children}
+      {hint && <div style={{ fontSize: 11.5, color: MUTED, marginTop: 4 }}>{hint}</div>}
+    </div>
+  );
+}
+
+function Combo({ label, value, onChange, options, placeholder, hint }) {
+  const [open, setOpen] = useState(false);
+  const [highlight, setHighlight] = useState(0);
+  const filtered = useMemo(() => {
+    const q = norm(value);
+    if (!q) return options;
+    const starts = options.filter((o) => norm(o).startsWith(q));
+    const contains = options.filter((o) => !norm(o).startsWith(q) && norm(o).includes(q));
+    return [...starts, ...contains];
+  }, [options, value]);
+  function select(o) { onChange(o); setOpen(false); }
+  return (
+    <Field label={label} hint={hint}>
+      <div style={{ position: "relative" }}>
+        <input
+          value={value}
+          onChange={(e) => { onChange(e.target.value); setOpen(true); setHighlight(0); }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => setTimeout(() => setOpen(false), 180)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown") { e.preventDefault(); setOpen(true); setHighlight((h) => Math.min(h + 1, filtered.length - 1)); }
+            else if (e.key === "ArrowUp") { e.preventDefault(); setHighlight((h) => Math.max(h - 1, 0)); }
+            else if (e.key === "Enter" && open && filtered[highlight]) { e.preventDefault(); select(filtered[highlight]); }
+            else if (e.key === "Escape") setOpen(false);
+          }}
+          placeholder={placeholder}
+          autoComplete="off"
+          style={inputStyle}
+        />
+        {open && (
+          <div style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 30, background: "#FFFFFF", border: `1.5px solid ${CREAM_LINE}`, borderRadius: 10, maxHeight: 224, overflowY: "auto", boxShadow: "0 10px 24px rgba(34,28,21,0.18)" }}>
+            {filtered.length === 0 ? (
+              <div style={{ padding: "12px 14px", fontSize: 13, color: MUTED }}>No matches — keep typing to add "{value}" as new</div>
+            ) : (
+              filtered.map((o, i) => (
+                <button key={o} onMouseDown={(e) => { e.preventDefault(); select(o); }} style={{ display: "block", width: "100%", textAlign: "left", padding: "11px 14px", background: i === highlight ? CREAM : "#FFFFFF", border: "none", borderBottom: `1px solid ${CREAM}`, fontSize: 14, color: INK, fontWeight: norm(o) === norm(value) ? 700 : 400 }}>
+                  {o}
+                </button>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+    </Field>
+  );
+}
+
+function RideCombo({ label, value, onChange, groupedOptions, placeholder }) {
+  const [open, setOpen] = useState(false);
+  const filtered = useMemo(() => {
+    const q = norm(value);
+    return groupedOptions
+      .map((g) => ({ land: g.land, items: g.items.filter((i) => !q || norm(i.name).includes(q)) }))
+      .filter((g) => g.items.length > 0);
+  }, [groupedOptions, value]);
+  function select(name) { onChange(name); setOpen(false); }
+  return (
+    <Field label={label}>
+      <div style={{ position: "relative" }}>
+        <input
+          value={value}
+          onChange={(e) => { onChange(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => setTimeout(() => setOpen(false), 180)}
+          placeholder={placeholder}
+          autoComplete="off"
+          style={inputStyle}
+        />
+        {open && (
+          <div style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 30, background: "#FFFFFF", border: `1.5px solid ${CREAM_LINE}`, borderRadius: 10, maxHeight: 260, overflowY: "auto", boxShadow: "0 10px 24px rgba(34,28,21,0.18)" }}>
+            {filtered.length === 0 ? (
+              <div style={{ padding: "12px 14px", fontSize: 13, color: MUTED }}>No matches — keep typing to add "{value}" as new</div>
+            ) : (
+              filtered.map((g) => (
+                <div key={g.land}>
+                  <div style={{ position: "sticky", top: 0, background: CREAM, padding: "6px 14px", fontSize: 10.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: BURNT_ORANGE }}>{g.land}</div>
+                  {g.items.map((item) => (
+                    <button key={item.name} onMouseDown={(e) => { e.preventDefault(); select(item.name); }} style={{ display: "block", width: "100%", textAlign: "left", padding: "10px 14px", background: "#FFFFFF", border: "none", borderBottom: `1px solid ${CREAM}`, fontSize: 14, color: INK, fontWeight: norm(item.name) === norm(value) ? 700 : 400 }}>
+                      {item.name}
+                    </button>
+                  ))}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+    </Field>
+  );
+}
+
+function Badge({ color, light, children }) {
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", padding: "3px 9px", borderRadius: 999, fontSize: 11, fontWeight: 600, background: light ? `${color}22` : color, color: light ? color : "#FFFFFF", whiteSpace: "nowrap" }}>
+      {children}
+    </span>
+  );
+}
+
+function SegButtons({ options, value, onChange }) {
+  return (
+    <div style={{ display: "flex", gap: 6 }}>
+      {options.map((o) => {
+        const selected = value === o.id;
+        return (
+          <button key={o.id} onClick={() => onChange(o.id)} style={{ flex: 1, padding: "10px 4px", borderRadius: 8, border: selected ? `1.5px solid ${o.color}` : `1.5px solid ${CREAM_LINE}`, background: selected ? o.color : "#FFFFFF", color: selected ? "#FFFFFF" : "#5A5041", fontSize: 12.5, fontWeight: 600, lineHeight: 1.2 }}>
+            {o.short}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+const TABS = [
+  { id: "track", label: "Track" },
+  { id: "visits", label: "Visits" },
+  { id: "stats", label: "Stats" },
+  { id: "insights", label: "Insights" },
+  { id: "challenges", label: "Challenges" },
+  { id: "passport", label: "Passport" },
+];
+
+// ============================================================
+// App
+// ============================================================
+function App() {
+  useGoogleFonts();
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [tab, setTab] = useState("track");
+  const [now, setNow] = useState(Date.now());
+
+  const [records, setRecords] = useState([]);
+  const [visits, setVisits] = useState([]);
+  const [activeVisitId, setActiveVisitId] = useState(null);
+  const [active, setActive] = useState(null);
+  const [customCatalog, setCustomCatalog] = useState({});
+  const [customChallenges, setCustomChallenges] = useState([]);
+  const [rideLocations, setRideLocations] = useState({});
+  const [lastDefaults, setLastDefaults] = useState({});
+
+  useEffect(() => {
+    if (!active) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [active]);
+
+  useEffect(() => {
+    (async () => {
+      async function loadJSON(key, fallback) {
+        try {
+          const res = await window.storage.get(key, false);
+          return res?.value ? JSON.parse(res.value) : fallback;
+        } catch (e) {
+          return fallback;
+        }
+      }
+      try {
+        setRecords(await loadJSON("records", []));
+        setVisits(await loadJSON("visits", []));
+        setActiveVisitId(await loadJSON("active-visit-id", null));
+        setActive(await loadJSON("active", null));
+        setCustomCatalog(await loadJSON("custom-catalog", {}));
+        setCustomChallenges(await loadJSON("custom-challenges", []));
+        setRideLocations(await loadJSON("ride-locations", {}));
+        setLastDefaults(await loadJSON("last-visit-defaults", {}));
+      } catch (e) {
+        setError("Couldn't load your saved data. You can still use the app this session.");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  async function persist(key, setter, value) {
+    setter(value);
+    try {
+      if (value === null || value === undefined) {
+        await window.storage.delete(key, false);
+      } else {
+        await window.storage.set(key, JSON.stringify(value), false);
+      }
+    } catch (e) {
+      setError("Couldn't save that — it may not persist.");
+    }
+  }
+
+  const catalog = useMemo(() => mergeCatalog(CATALOG, customCatalog), [customCatalog]);
+
+  function rememberOwnerResort(owner, resort) {
+    setCustomCatalog((prev) => {
+      const next = JSON.parse(JSON.stringify(prev));
+      next[owner] = next[owner] || {};
+      next[owner][resort] = next[owner][resort] || {};
+      window.storage.set("custom-catalog", JSON.stringify(next), false).catch(() => {});
+      return next;
+    });
+  }
+
+  function rememberCustom(owner, resort, park, land, attraction, type) {
+    setCustomCatalog((prev) => {
+      const next = JSON.parse(JSON.stringify(prev));
+      next[owner] = next[owner] || {};
+      next[owner][resort] = next[owner][resort] || {};
+      next[owner][resort][park] = next[owner][resort][park] || {};
+      if (land) {
+        next[owner][resort][park][land] = next[owner][resort][park][land] || [];
+        if (attraction && !next[owner][resort][park][land].some((a) => norm(a.name) === norm(attraction))) {
+          const seedHas = findAttractionInPark(CATALOG, owner, resort, park, attraction);
+          if (!seedHas) next[owner][resort][park][land].push({ name: attraction, type: type || "ride" });
+        }
+      }
+      window.storage.set("custom-catalog", JSON.stringify(next), false).catch(() => {});
+      return next;
+    });
+  }
+
+  const activeVisit = useMemo(() => visits.find((v) => v.id === activeVisitId) || null, [visits, activeVisitId]);
+
+  function startVisit(owner, resort, date) {
+    const visit = { id: uid(), owner, resort, date, parks: [], currentPark: "", startedAt: new Date().toISOString(), endedAt: null };
+    persist("visits", setVisits, [visit, ...visits]);
+    persist("active-visit-id", setActiveVisitId, visit.id);
+    persist("last-visit-defaults", setLastDefaults, { owner, resort });
+    rememberOwnerResort(owner, resort);
+  }
+
+  function endVisit() {
+    if (!activeVisit) return;
+    const nextVisits = visits.map((v) => (v.id === activeVisit.id ? { ...v, endedAt: new Date().toISOString() } : v));
+    persist("visits", setVisits, nextVisits);
+    persist("active-visit-id", setActiveVisitId, null);
+  }
+
+  function deleteVisit(id) {
+    persist("records", setRecords, records.filter((rec) => rec.visitId !== id));
+    persist("visits", setVisits, visits.filter((v) => v.id !== id));
+    if (activeVisitId === id) {
+      persist("active-visit-id", setActiveVisitId, null);
+      if (active && active.visitId === id) persist("active", setActive, null);
+    }
+  }
+
+  function startLine({ park, land, attraction, type, lineType, postedWait, meetDetail }) {
+    if (!activeVisit) return;
+    const session = {
+      id: uid(), visitId: activeVisit.id, owner: activeVisit.owner, resort: activeVisit.resort,
+      park, land, attraction, type, lineType, postedWait, meetDetail: meetDetail || "",
+      brokeDown: false, note: "",
+      startTime: new Date().toISOString(),
+    };
+    persist("active", setActive, session);
+    if (activeVisit.currentPark !== park) {
+      const nextVisits = visits.map((v) => (v.id === activeVisit.id ? { ...v, currentPark: park } : v));
+      persist("visits", setVisits, nextVisits);
+    }
+    rememberCustom(activeVisit.owner, activeVisit.resort, park, land || "General", attraction, type);
+  }
+
+  function toggleBreakdown() {
+    if (!active) return;
+    persist("active", setActive, { ...active, brokeDown: !active.brokeDown, note: active.brokeDown ? "" : active.note });
+  }
+  function updateActiveNote(note) {
+    if (!active) return;
+    persist("active", setActive, { ...active, note });
+  }
+
+  function finishLine(outcome) {
+    if (!active) return;
+    const endTime = new Date().toISOString();
+    const waitMinutes = (new Date(endTime) - new Date(active.startTime)) / 60000;
+    const visit = visits.find((v) => v.id === active.visitId);
+    const record = {
+      id: active.id, visitId: active.visitId,
+      owner: active.owner, resort: active.resort, park: active.park, land: active.land,
+      attraction: active.attraction, type: active.type,
+      lineType: active.lineType, postedWait: active.postedWait,
+      brokeDown: active.brokeDown, note: active.note, meetDetail: active.meetDetail || "",
+      outcome,
+      date: visit ? visit.date : todayStr(),
+      startTime: active.startTime, endTime, waitMinutes,
+    };
+    persist("records", setRecords, [record, ...records]);
+    if (visit && !visit.parks.includes(active.park)) {
+      const nextVisits = visits.map((v) => (v.id === visit.id ? { ...v, parks: [...v.parks, active.park] } : v));
+      persist("visits", setVisits, nextVisits);
+    }
+    persist("active", setActive, null);
+  }
+  function boardRide() { finishLine("boarded"); }
+  function leaveLine() { finishLine("left"); }
+  function cancelLine() { persist("active", setActive, null); }
+
+  function deleteRecord(id) {
+    persist("records", setRecords, records.filter((rec) => rec.id !== id));
+  }
+  function updateRecord(id, updates) {
+    persist("records", setRecords, records.map((rec) => (rec.id === id ? { ...rec, ...updates } : rec)));
+  }
+
+  function addCustomChallenge(ch) {
+    persist("custom-challenges", setCustomChallenges, [...customChallenges, { ...ch, id: uid(), custom: true }]);
+  }
+  function deleteCustomChallenge(id) {
+    persist("custom-challenges", setCustomChallenges, customChallenges.filter((c) => c.id !== id));
+  }
+
+  async function saveRideLocation(park, land, attraction) {
+    try {
+      const pos = await getPosition();
+      const key = `${norm(park)}||${norm(attraction)}`;
+      const next = { ...rideLocations, [key]: { park, land, attraction, lat: pos.lat, lng: pos.lng, savedAt: new Date().toISOString() } };
+      persist("ride-locations", setRideLocations, next);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  function exportBackup() {
+    const payload = {
+      backupVersion: 1, exportedAt: new Date().toISOString(),
+      records, visits, customCatalog, customChallenges, rideLocations, lastDefaults,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `standby-backup-${todayStr()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  async function importBackup(file) {
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      if (!Array.isArray(data.records) || !Array.isArray(data.visits)) throw new Error("That file doesn't look like a Standby backup.");
+      await persist("records", setRecords, data.records || []);
+      await persist("visits", setVisits, data.visits || []);
+      await persist("custom-catalog", setCustomCatalog, data.customCatalog || {});
+      await persist("custom-challenges", setCustomChallenges, data.customChallenges || []);
+      await persist("ride-locations", setRideLocations, data.rideLocations || {});
+      await persist("last-visit-defaults", setLastDefaults, data.lastDefaults || {});
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message || "Couldn't read that file." };
+    }
+  }
+
+  const allChallenges = useMemo(() => [...BUILT_IN_CHALLENGES, ...customChallenges], [customChallenges]);
+  const elapsedSeconds = active ? Math.max(0, Math.floor((now - new Date(active.startTime)) / 1000)) : 0;
+
+  return (
+    <div style={{ minHeight: "100vh", background: CREAM, fontFamily: "'Inter', sans-serif", color: INK, display: "flex", flexDirection: "column", alignItems: "center", paddingBottom: 48 }}>
+      <style>{`
+        * { box-sizing: border-box; }
+        input, select, button, textarea { font-family: 'Inter', sans-serif; }
+        input:focus, select:focus, button:focus-visible, textarea:focus { outline: 2px solid ${TEAL}; outline-offset: 2px; }
+        button { cursor: pointer; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+        .display-font { font-family: 'Poppins', sans-serif; font-weight: 800; letter-spacing: 0.01em; }
+        .tabbar::-webkit-scrollbar { display: none; }
+      `}</style>
+
+      <header style={{ width: "100%", maxWidth: 480, padding: "28px 20px 8px", position: "relative" }}>
+        <SunburstAccent />
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, position: "relative" }}>
+          <h1 className="display-font" style={{ fontSize: 38, margin: 0, color: CHARCOAL, lineHeight: 1 }}>STANDBY</h1>
+          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: "0.12em", color: TEAL, fontWeight: 500, textTransform: "uppercase" }}>queue log</span>
+        </div>
+        <p style={{ margin: "4px 0 0", fontSize: 13.5, color: "#5A5041", position: "relative" }}>Clock in when you join the line. Clock out when you board.</p>
+      </header>
+
+      <nav className="tabbar" style={{ width: "100%", maxWidth: 480, display: "flex", gap: 0, padding: "12px 20px 0", overflowX: "auto", scrollbarWidth: "none" }}>
+        {TABS.map((t) => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: "0 0 auto", padding: "10px 14px", background: "transparent", border: "none", borderBottom: tab === t.id ? `3px solid ${MUSTARD}` : "3px solid transparent", color: tab === t.id ? CHARCOAL : MUTED, fontWeight: 700, fontSize: 13.5, whiteSpace: "nowrap" }}>
+            {t.label}
+          </button>
+        ))}
+      </nav>
+
+      {error && (
+        <div style={{ width: "100%", maxWidth: 480, margin: "12px 20px 0", padding: "10px 14px", background: "#F9E4E1", color: "#7A2E27", fontSize: 13, borderRadius: 6 }}>
+          {error}
+        </div>
+      )}
+
+      <main style={{ width: "100%", maxWidth: 480, padding: "16px 20px 0", flex: 1 }}>
+        {loading ? (
+          <div style={{ textAlign: "center", padding: 60, color: MUTED }}>Loading your log…</div>
+        ) : tab === "track" ? (
+          <TrackView
+            catalog={catalog} activeVisit={activeVisit} active={active} elapsedSeconds={elapsedSeconds}
+            lastDefaults={lastDefaults}
+            startVisit={startVisit} endVisit={endVisit} startLine={startLine} boardRide={boardRide}
+            leaveLine={leaveLine} cancelLine={cancelLine} toggleBreakdown={toggleBreakdown} updateActiveNote={updateActiveNote}
+            rideLocations={rideLocations} saveRideLocation={saveRideLocation}
+          />
+        ) : tab === "visits" ? (
+          <VisitsView visits={visits} records={records} deleteVisit={deleteVisit} deleteRecord={deleteRecord} updateRecord={updateRecord} />
+        ) : tab === "stats" ? (
+          <StatsView records={records} deleteRecord={deleteRecord} updateRecord={updateRecord} exportBackup={exportBackup} importBackup={importBackup} />
+        ) : tab === "insights" ? (
+          <InsightsView records={records} />
+        ) : tab === "challenges" ? (
+          <ChallengesView challenges={allChallenges} records={records} catalog={catalog}
+            addCustomChallenge={addCustomChallenge} deleteCustomChallenge={deleteCustomChallenge} />
+        ) : (
+          <PassportView records={records} catalog={catalog} />
+        )}
+      </main>
+    </div>
+  );
+}
+
+function SunburstAccent() {
+  return (
+    <svg width="64" height="64" viewBox="0 0 64 64" style={{ position: "absolute", top: 14, right: 16, opacity: 0.5 }} aria-hidden="true">
+      {Array.from({ length: 12 }).map((_, i) => {
+        const angle = (i * 30 * Math.PI) / 180;
+        const x2 = 32 + Math.cos(angle) * 30;
+        const y2 = 32 + Math.sin(angle) * 30;
+        const x1 = 32 + Math.cos(angle) * 16;
+        const y1 = 32 + Math.sin(angle) * 16;
+        return <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke={MUSTARD} strokeWidth="3" strokeLinecap="round" />;
+      })}
+    </svg>
+  );
+}
+
+// ============================================================
+// TRACK
+// ============================================================
+function TrackView({ catalog, activeVisit, active, elapsedSeconds, lastDefaults, startVisit, endVisit, startLine, boardRide, leaveLine, cancelLine, toggleBreakdown, updateActiveNote, rideLocations, saveRideLocation }) {
+  const [owner, setOwner] = useState(lastDefaults.owner || "");
+  const [resort, setResort] = useState(lastDefaults.resort || "");
+  const [date, setDate] = useState(todayStr());
+
+  const [park, setPark] = useState("");
+  const [attraction, setAttraction] = useState("");
+  const [land, setLand] = useState("");
+  const [attrType, setAttrType] = useState("ride");
+  const [lineType, setLineType] = useState("standby");
+  const [postedWait, setPostedWait] = useState("");
+  const [meetDetail, setMeetDetail] = useState("");
+
+  const [showLocation, setShowLocation] = useState(false);
+  const [locBusy, setLocBusy] = useState(false);
+  const [locMsg, setLocMsg] = useState("");
+  const [nearby, setNearby] = useState(null);
+
+  useEffect(() => {
+    setPark(activeVisit?.currentPark || "");
+    setAttraction(""); setLand(""); setMeetDetail(""); setNearby(null); setLocMsg("");
+  }, [activeVisit?.id]);
+
+  const owners = sortedOwners();
+  const resorts = owner ? getResorts(catalog, owner) : [];
+  const visitParks = activeVisit ? getParks(catalog, activeVisit.owner, activeVisit.resort) : [];
+  const groupedRides = activeVisit && park ? getGroupedAttractionsForPark(catalog, activeVisit.owner, activeVisit.resort, park) : [];
+
+  const currentMatch = activeVisit && park && attraction ? findAttractionInPark(catalog, activeVisit.owner, activeVisit.resort, park, attraction) : null;
+  const needsWriteIn = currentMatch?.writeIn === true;
+
+  function onAttractionChange(val) {
+    setAttraction(val);
+    if (activeVisit && park) {
+      const match = findAttractionInPark(catalog, activeVisit.owner, activeVisit.resort, park, val);
+      setLand(match ? match.land : "");
+      if (match) setAttrType(match.type);
+      if (!match?.writeIn) setMeetDetail("");
+    }
+  }
+
+  function handleStartLine() {
+    if (!park.trim() || !attraction.trim()) return;
+    startLine({
+      park: park.trim(), land: land.trim() || "General", attraction: attraction.trim(), type: attrType,
+      lineType, postedWait: postedWait.trim() === "" ? null : Number(postedWait),
+      meetDetail: needsWriteIn ? meetDetail.trim() : "",
+    });
+    setAttraction(""); setLand(""); setPostedWait(""); setAttrType("ride"); setLineType("standby"); setMeetDetail("");
+    setNearby(null); setLocMsg("");
+  }
+
+  async function handleDetectPark() {
+    setLocBusy(true); setLocMsg("");
+    try {
+      const pos = await getPosition();
+      const candidates = visitParks.map((name) => ({ name, coord: PARK_COORDS[norm(name)] })).filter((c) => c.coord);
+      if (candidates.length === 0) { setLocMsg("No known coordinates for the parks in this resort yet."); return; }
+      const withDist = candidates.map((c) => ({ ...c, d: haversineMeters(pos.lat, pos.lng, c.coord.lat, c.coord.lng) })).sort((a, b) => a.d - b.d);
+      if (withDist[0].d > 6000) { setLocMsg("You don't seem to be near a park in this resort right now."); return; }
+      setPark(withDist[0].name); setAttraction(""); setLand("");
+      setLocMsg(`Set park to ${withDist[0].name} (${fmtDistance(withDist[0].d)} away).`);
+    } catch (e) {
+      setLocMsg(e.message || "Couldn't get your location.");
+    } finally {
+      setLocBusy(false);
+    }
+  }
+
+  async function handleFindNearby() {
+    setLocBusy(true); setLocMsg(""); setNearby(null);
+    try {
+      const pos = await getPosition();
+      const entries = Object.values(rideLocations).filter((e) => !park || norm(e.park) === norm(park));
+      if (entries.length === 0) { setLocMsg("No pinned ride locations yet for this park — pin one below once you're there."); return; }
+      const withDist = entries.map((e) => ({ ...e, d: haversineMeters(pos.lat, pos.lng, e.lat, e.lng) })).sort((a, b) => a.d - b.d).slice(0, 5);
+      setNearby(withDist);
+    } catch (e) {
+      setLocMsg(e.message || "Couldn't get your location.");
+    } finally {
+      setLocBusy(false);
+    }
+  }
+
+  async function handlePin() {
+    if (!park.trim() || !attraction.trim()) return;
+    setLocBusy(true); setLocMsg("");
+    const res = await saveRideLocation(park.trim(), land || "General", attraction.trim());
+    setLocMsg(res.ok ? `Pinned "${attraction}" at your current location.` : res.error || "Couldn't save your location.");
+    setLocBusy(false);
+  }
+
+  if (!activeVisit) {
+    return (
+      <div style={{ marginTop: 8 }}>
+        <div style={{ background: CHARCOAL, borderRadius: 16, padding: "22px 20px", textAlign: "center", boxShadow: "0 8px 24px rgba(34,28,21,0.3)" }}>
+          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: "0.25em", color: "#8A8171", textTransform: "uppercase" }}>no active visit</div>
+          <div className="display-font" style={{ fontSize: 28, color: "#5A5344", marginTop: 10 }}>START A VISIT</div>
+          <div style={{ fontSize: 12.5, color: "#9C9585", marginTop: 4 }}>Ties every ride you log today to this visit, even if you park hop.</div>
+        </div>
+        <div style={{ marginTop: 20 }}>
+          <Combo label="Park owner" value={owner} onChange={(v) => { setOwner(v); setResort(""); }} options={owners} placeholder="e.g. The Walt Disney Company" />
+          <Combo label="Resort / park" value={resort} onChange={setResort} options={resorts} placeholder="e.g. Walt Disney World Resort" hint="Type a new one if it's not listed yet." />
+          <Field label="Date">
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={inputStyle} />
+          </Field>
+          <button onClick={() => owner.trim() && resort.trim() && startVisit(owner.trim(), resort.trim(), date)} disabled={!owner.trim() || !resort.trim()} style={{ width: "100%", marginTop: 6, padding: "16px 0", background: owner.trim() && resort.trim() ? TEAL : "#CBBE9C", color: "#FFFFFF", border: "none", borderRadius: 10, fontSize: 16, fontWeight: 700 }}>
+            Start visit
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <VisitBanner visit={activeVisit} onEnd={endVisit} lineActive={!!active} />
+
+      <div style={{ background: CHARCOAL, borderRadius: 16, padding: "26px 20px", textAlign: "center", boxShadow: "0 8px 24px rgba(34,28,21,0.3)", marginTop: 14 }}>
+        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: "0.25em", color: active ? MUSTARD : "#8A8171", textTransform: "uppercase" }}>
+          {active ? "● in line" : "no active line"}
+        </div>
+        <div className="display-font" style={{ fontSize: 56, color: active ? MUSTARD : "#5A5344", marginTop: 16, fontVariantNumeric: "tabular-nums" }}>
+          {active ? fmtClock(elapsedSeconds) : "00:00"}
+        </div>
+        <div style={{ marginTop: 10, fontSize: 13, color: active ? CREAM : "#9C9585", fontWeight: 500 }}>
+          {active ? `${active.attraction} · ${active.park}` : "Fill in the ride below to begin"}
+        </div>
+        {active && (
+          <div style={{ marginTop: 12, display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+            <Badge color={lineTypeMeta(active.lineType).color} light>{lineTypeMeta(active.lineType).short}</Badge>
+            <Badge color="#9C9585" light>{active.type === "show" ? "Show" : "Ride"}</Badge>
+            {active.postedWait != null && (
+              <Badge color="#9C9585" light>
+                Posted {active.postedWait} min
+                {elapsedSeconds >= 60 && ` · ${elapsedSeconds / 60 - active.postedWait >= 0 ? "+" : ""}${Math.round(elapsedSeconds / 60 - active.postedWait)} min so far`}
+              </Badge>
+            )}
+            {active.brokeDown && <Badge color={CORAL}>🛠 Ride down</Badge>}
+          </div>
+        )}
+      </div>
+
+      {active && (
+        <div style={{ marginTop: 14 }}>
+          <button onClick={toggleBreakdown} style={{ width: "100%", padding: "11px 0", borderRadius: 8, fontSize: 13.5, fontWeight: 700, background: active.brokeDown ? CORAL : "transparent", color: active.brokeDown ? "#FFFFFF" : "#8A5A2E", border: active.brokeDown ? `1.5px solid ${CORAL}` : "1.5px solid #C9A96A" }}>
+            🛠 {active.brokeDown ? "Ride is down — tap to clear" : "Ride broke down / stopped"}
+          </button>
+          {active.brokeDown && (
+            <div style={{ marginTop: 8 }}>
+              <input defaultValue={active.note} onBlur={(e) => updateActiveNote(e.target.value)} placeholder="What happened? (optional)" style={inputStyle} />
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ marginTop: 20 }}>
+        {!active ? (
+          <>
+            <Combo label="Park" value={park} onChange={(v) => { setPark(v); setAttraction(""); setLand(""); }} options={visitParks} placeholder="e.g. Disney California Adventure" hint="Stays set until you change it — no need to re-pick each ride." />
+
+            <button onClick={() => setShowLocation((s2) => !s2)} style={{ display: "block", marginBottom: 12, fontSize: 12, fontWeight: 700, color: TEAL, background: "transparent", border: "none", padding: 0 }}>
+              📍 {showLocation ? "Hide location tools" : "Use my location"}
+            </button>
+            {showLocation && (
+              <div style={{ background: "#FFFFFF", border: `1px solid ${CREAM_LINE}`, borderRadius: 10, padding: 12, marginBottom: 14 }}>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={handleDetectPark} disabled={locBusy} style={{ flex: 1, padding: "9px 0", background: CREAM, border: `1px solid ${CREAM_LINE}`, borderRadius: 7, fontSize: 12, fontWeight: 700, color: INK }}>🧭 Detect my park</button>
+                  <button onClick={handleFindNearby} disabled={locBusy} style={{ flex: 1, padding: "9px 0", background: CREAM, border: `1px solid ${CREAM_LINE}`, borderRadius: 7, fontSize: 12, fontWeight: 700, color: INK }}>📍 Nearest ride</button>
+                </div>
+                {locBusy && <div style={{ fontSize: 11.5, color: MUTED, marginTop: 8 }}>Getting your location…</div>}
+                {locMsg && !locBusy && <div style={{ fontSize: 11.5, color: MUTED, marginTop: 8 }}>{locMsg}</div>}
+                {nearby && (
+                  <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                    {nearby.map((n2) => (
+                      <button key={n2.park + n2.attraction} onClick={() => { setPark(n2.park); setAttraction(n2.attraction); setLand(n2.land || ""); setNearby(null); }} style={{ textAlign: "left", background: CREAM, border: "none", borderRadius: 6, padding: "8px 10px", fontSize: 12.5 }}>
+                        <b>{n2.attraction}</b> · {n2.park} — {fmtDistance(n2.d)} away
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div style={{ fontSize: 10.5, color: MUTED, marginTop: 8 }}>Ride-level matching only works for rides you've pinned before — tap "Pin this ride" below once you're standing at one.</div>
+              </div>
+            )}
+
+            {park && groupedRides.length > 0 ? (
+              <RideCombo label="Ride or show" value={attraction} onChange={onAttractionChange} groupedOptions={groupedRides} placeholder="e.g. Radiator Springs Racers" />
+            ) : (
+              <Combo label="Ride or show" value={attraction} onChange={onAttractionChange} options={[]} placeholder="Type a ride or show name" hint={park ? "Nothing on file yet for this park — type any name to add it." : "Pick a park first."} />
+            )}
+
+            {attraction.trim() && (
+              <button onClick={handlePin} disabled={locBusy} style={{ display: "block", marginTop: -6, marginBottom: 12, fontSize: 11.5, fontWeight: 700, color: BURNT_ORANGE, background: "transparent", border: "none", padding: 0 }}>
+                📌 Pin this ride's location
+              </button>
+            )}
+
+            {needsWriteIn && (
+              <Field label="Who did you meet?">
+                <input value={meetDetail} onChange={(e) => setMeetDetail(e.target.value)} placeholder="e.g. Mickey Mouse" style={inputStyle} />
+              </Field>
+            )}
+
+            <Field label="Type">
+              <SegButtons options={[{ id: "ride", short: "Ride", color: TEAL }, { id: "show", short: "Show", color: PLUM }]} value={attrType} onChange={setAttrType} />
+            </Field>
+            <Field label="Line type">
+              <SegButtons options={LINE_TYPES} value={lineType} onChange={setLineType} />
+            </Field>
+            <Field label="Posted wait time (optional)">
+              <div style={{ position: "relative" }}>
+                <input type="number" inputMode="numeric" min="0" value={postedWait} onChange={(e) => setPostedWait(e.target.value)} placeholder="e.g. 45" style={{ ...inputStyle, paddingRight: 48 }} />
+                <span style={{ position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)", fontSize: 12.5, color: MUTED }}>min</span>
+              </div>
+            </Field>
+            <button onClick={handleStartLine} disabled={!park.trim() || !attraction.trim()} style={{ width: "100%", marginTop: 4, padding: "16px 0", background: park.trim() && attraction.trim() ? TEAL : "#CBBE9C", color: "#FFFFFF", border: "none", borderRadius: 10, fontSize: 16, fontWeight: 700 }}>
+              Get in line
+            </button>
+          </>
+        ) : (
+          <div>
+            <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+              <button onClick={boardRide} style={{ flex: 2, padding: "16px 0", background: CORAL, color: "#FFFFFF", border: "none", borderRadius: 10, fontSize: 16, fontWeight: 700 }}>Board</button>
+              <button onClick={leaveLine} style={{ flex: 1, padding: "16px 0", background: "transparent", color: "#5A5041", border: `1.5px solid ${CREAM_LINE}`, borderRadius: 10, fontSize: 12.5, fontWeight: 600 }}>Left line</button>
+            </div>
+            <button onClick={cancelLine} style={{ width: "100%", marginTop: 8, padding: "9px 0", background: "transparent", color: "#B8AC8F", border: "none", fontSize: 12, fontWeight: 600 }}>
+              Started this by mistake? Discard entry
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function VisitBanner({ visit, onEnd, lineActive }) {
+  const [confirming, setConfirming] = useState(false);
+  return (
+    <div style={{ background: "#FFFFFF", border: `1px solid ${CREAM_LINE}`, borderRadius: 12, padding: "12px 14px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 14.5 }}>{visit.resort}</div>
+          <div style={{ fontSize: 12, color: TEAL, fontWeight: 600 }}>{visit.owner}</div>
+          <div style={{ fontSize: 11.5, color: MUTED, marginTop: 2 }}>{fmtDateStr(visit.date)}</div>
+        </div>
+        {!confirming ? (
+          <button onClick={() => setConfirming(true)} style={{ fontSize: 11.5, fontWeight: 600, color: CORAL, background: "transparent", border: `1px solid ${CORAL}`, borderRadius: 6, padding: "5px 9px" }}>End visit</button>
+        ) : (
+          <div style={{ display: "flex", gap: 4 }}>
+            {lineActive ? (
+              <span style={{ fontSize: 10.5, color: MUTED, maxWidth: 110 }}>Board or cancel your ride first</span>
+            ) : (
+              <button onClick={onEnd} style={{ fontSize: 11, fontWeight: 700, color: "#FFF", background: CORAL, border: "none", borderRadius: 6, padding: "5px 9px" }}>Confirm</button>
+            )}
+            <button onClick={() => setConfirming(false)} style={{ fontSize: 11, color: MUTED, background: "transparent", border: "none" }}>×</button>
+          </div>
+        )}
+      </div>
+      {visit.parks.length > 0 && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+          {visit.parks.map((p2) => <Badge key={p2} color={TEAL} light>{p2}</Badge>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// VISITS
+// ============================================================
+function VisitsView({ visits, records, deleteVisit, deleteRecord, updateRecord }) {
+  const [openId, setOpenId] = useState(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  if (visits.length === 0) {
+    return <EmptyState title="NO VISITS YET" body="Start a visit from the Track tab and it'll show up here." />;
+  }
+  const sorted = visits.slice().sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+  return (
+    <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 10 }}>
+      {sorted.map((v) => {
+        const vRecords = records.filter((rec) => rec.visitId === v.id);
+        const boarded = vRecords.filter((r2) => r2.outcome !== "left");
+        const avg = boarded.length ? boarded.reduce((s2, rec) => s2 + rec.waitMinutes, 0) / boarded.length : null;
+        const open = openId === v.id;
+        const confirming = confirmDeleteId === v.id;
+        return (
+          <div key={v.id} style={{ background: "#FFFFFF", border: `1px solid ${CREAM_LINE}`, borderRadius: 12, overflow: "hidden" }}>
+            <button onClick={() => setOpenId(open ? null : v.id)} style={{ width: "100%", textAlign: "left", background: "transparent", border: "none", padding: "14px 16px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 14.5 }}>{v.resort}</div>
+                  <div style={{ fontSize: 12, color: TEAL, fontWeight: 600, marginTop: 1 }}>{v.owner}</div>
+                  <div style={{ fontSize: 11.5, color: MUTED, marginTop: 3 }}>{fmtDateStr(v.date)}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div className="display-font" style={{ fontSize: 20, color: CHARCOAL }}>{vRecords.length}</div>
+                  <div style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", letterSpacing: "0.08em" }}>rides</div>
+                </div>
+              </div>
+              {v.parks.length > 0 && (
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+                  {v.parks.map((p2) => <Badge key={p2} color={TEAL} light>{p2}</Badge>)}
+                </div>
+              )}
+              {avg != null && <div style={{ fontSize: 12, color: "#5A5041", marginTop: 8 }}>Average wait: {fmtMinutes(avg)}</div>}
+            </button>
+
+            <div style={{ display: "flex", justifyContent: "flex-end", padding: "0 16px 12px", gap: 8, alignItems: "center" }}>
+              {confirming ? (
+                <>
+                  <span style={{ fontSize: 11, color: MUTED }}>Delete visit & {vRecords.length} ride{vRecords.length === 1 ? "" : "s"}?</span>
+                  <button onClick={() => { deleteVisit(v.id); setConfirmDeleteId(null); }} style={{ fontSize: 11, fontWeight: 700, color: "#FFF", background: CORAL, border: "none", borderRadius: 6, padding: "5px 9px" }}>Delete</button>
+                  <button onClick={() => setConfirmDeleteId(null)} style={{ fontSize: 11, color: MUTED, background: "transparent", border: "none" }}>Cancel</button>
+                </>
+              ) : (
+                <button onClick={() => setConfirmDeleteId(v.id)} style={{ fontSize: 11.5, color: CORAL, background: "transparent", border: "none", fontWeight: 600 }}>Delete visit</button>
+              )}
+            </div>
+
+            {open && (
+              <div style={{ borderTop: `1px dashed ${CREAM_LINE}`, padding: "12px 16px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+                {vRecords.length === 0 ? (
+                  <div style={{ fontSize: 12.5, color: MUTED }}>No rides logged for this visit.</div>
+                ) : (
+                  vRecords.slice().sort((a, b) => new Date(a.startTime) - new Date(b.startTime)).map((rec) => (
+                    <TicketCard key={rec.id} record={rec} onDelete={() => deleteRecord(rec.id)} onSave={updateRecord} />
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ============================================================
+// STATS
+// ============================================================
+function BackupPanel({ exportBackup, importBackup, hasData }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [confirmRestore, setConfirmRestore] = useState(null);
+
+  async function handleFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setConfirmRestore(file);
+  }
+
+  async function doRestore(file) {
+    setBusy(true); setMsg(""); setConfirmRestore(null);
+    const res = await importBackup(file);
+    setMsg(res.ok ? "Restored! Switch tabs to see your data." : res.error);
+    setBusy(false);
+  }
+
+  return (
+    <div style={{ background: "#FFFFFF", border: `1px solid ${CREAM_LINE}`, borderRadius: 10, padding: 12, marginBottom: 14 }}>
+      <div style={{ fontSize: 11.5, fontWeight: 700, color: MUTED, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Backup & restore</div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={exportBackup} disabled={!hasData} style={{ flex: 1, padding: "9px 0", background: hasData ? CHARCOAL : "#E3D3A8", color: hasData ? CREAM : "#B8AC8F", border: "none", borderRadius: 7, fontSize: 12, fontWeight: 700 }}>
+          ⬇ Download backup
+        </button>
+        <label style={{ flex: 1, padding: "9px 0", background: CREAM, border: `1px solid ${CREAM_LINE}`, borderRadius: 7, fontSize: 12, fontWeight: 700, color: INK, textAlign: "center", cursor: "pointer" }}>
+          ⬆ Restore backup
+          <input type="file" accept="application/json" onChange={handleFile} style={{ display: "none" }} />
+        </label>
+      </div>
+      {confirmRestore && (
+        <div style={{ marginTop: 8, fontSize: 12, color: MUTED }}>
+          This replaces everything currently in the app with "{confirmRestore.name}".
+          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+            <button onClick={() => doRestore(confirmRestore)} style={{ fontSize: 11.5, fontWeight: 700, color: "#FFF", background: CORAL, border: "none", borderRadius: 6, padding: "5px 10px" }}>Replace my data</button>
+            <button onClick={() => setConfirmRestore(null)} style={{ fontSize: 11.5, color: MUTED, background: "transparent", border: "none" }}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {busy && <div style={{ fontSize: 11.5, color: MUTED, marginTop: 6 }}>Working…</div>}
+      {msg && !busy && <div style={{ fontSize: 11.5, color: MUTED, marginTop: 6 }}>{msg}</div>}
+    </div>
+  );
+}
+
+function StatsView({ records, deleteRecord, updateRecord, exportBackup, importBackup }) {
+  const [filterPark, setFilterPark] = useState("All parks");
+  const [filterType, setFilterType] = useState("All types");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+
+  const parks = useMemo(() => Array.from(new Set(records.map((rec) => rec.park))).sort(), [records]);
+
+  const filtered = useMemo(() => {
+    return records
+      .filter((rec) => filterPark === "All parks" || rec.park === filterPark)
+      .filter((rec) => filterType === "All types" || rec.lineType === filterType)
+      .filter((rec) => !fromDate || rec.date >= fromDate)
+      .filter((rec) => !toDate || rec.date <= toDate)
+      .sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+  }, [records, filterPark, filterType, fromDate, toDate]);
+
+  const stats = useMemo(() => {
+    const boarded = filtered.filter((rec) => rec.outcome !== "left");
+    if (boarded.length === 0) return null;
+    const total = boarded.reduce((s2, rec) => s2 + rec.waitMinutes, 0);
+    const best = boarded.reduce((m, rec) => (rec.waitMinutes < m.waitMinutes ? rec : m));
+    const worst = boarded.reduce((m, rec) => (rec.waitMinutes > m.waitMinutes ? rec : m));
+    return { count: boarded.length, avg: total / boarded.length, best, worst };
+  }, [filtered]);
+
+  if (records.length === 0) {
+    return (
+      <div style={{ marginTop: 8 }}>
+        <BackupPanel exportBackup={exportBackup} importBackup={importBackup} hasData={false} />
+        <EmptyState title="NO ENTRIES YET" body="Log a wait from the Track tab, or restore a backup above." />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <BackupPanel exportBackup={exportBackup} importBackup={importBackup} hasData={true} />
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <select value={filterPark} onChange={(e) => setFilterPark(e.target.value)} style={{ ...inputStyle, flex: "1 1 130px", fontSize: 13.5, padding: "10px 8px" }}>
+          <option>All parks</option>
+          {parks.map((p2) => <option key={p2}>{p2}</option>)}
+        </select>
+        <select value={filterType} onChange={(e) => setFilterType(e.target.value)} style={{ ...inputStyle, flex: "1 1 130px", fontSize: 13.5, padding: "10px 8px" }}>
+          <option>All types</option>
+          {LINE_TYPES.map((t2) => <option key={t2.id} value={t2.id}>{t2.short}</option>)}
+        </select>
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <Field label="From"><input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} style={{ ...inputStyle, fontSize: 13.5, padding: "10px 8px" }} /></Field>
+        <Field label="To"><input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} style={{ ...inputStyle, fontSize: 13.5, padding: "10px 8px" }} /></Field>
+      </div>
+
+      <button onClick={() => downloadCSV(filtered, `standby-log-${todayStr()}.csv`)} disabled={filtered.length === 0} style={{ marginTop: 4, width: "100%", padding: "11px 0", background: "transparent", border: `1.5px solid ${CHARCOAL}`, color: CHARCOAL, borderRadius: 8, fontSize: 13.5, fontWeight: 700 }}>
+        Export {filtered.length} {filtered.length === 1 ? "entry" : "entries"} to CSV
+      </button>
+
+      {stats && (
+        <>
+          <div style={{ display: "flex", marginTop: 14, background: CHARCOAL, borderRadius: 10, overflow: "hidden" }}>
+            <StatCell label="rides" value={stats.count} />
+            <StatCell label="avg" value={fmtMinutes(stats.avg)} />
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+            <BestWorstCard label="Best (shortest) wait" color={TEAL} rec={stats.best} />
+            <BestWorstCard label="Worst (longest) wait" color={CORAL} rec={stats.worst} />
+          </div>
+        </>
+      )}
+
+      <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+        {filtered.map((rec) => <TicketCard key={rec.id} record={rec} onDelete={() => deleteRecord(rec.id)} onSave={updateRecord} />)}
+      </div>
+    </div>
+  );
+}
+
+function BestWorstCard({ label, color, rec }) {
+  return (
+    <div style={{ flex: 1, background: "#FFFFFF", border: `1.5px solid ${color}33`, borderRadius: 10, padding: "12px 12px" }}>
+      <div style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.06em", color: MUTED, fontWeight: 600 }}>{label}</div>
+      <div className="display-font" style={{ fontSize: 22, color, marginTop: 4 }}>{fmtMinutes(rec.waitMinutes)}</div>
+      <div style={{ fontSize: 11.5, color: "#5A5041", marginTop: 2 }}>{rec.attraction}</div>
+      <div style={{ fontSize: 10.5, color: MUTED }}>{rec.park} · {fmtDateShort(rec.date)}</div>
+    </div>
+  );
+}
+
+function StatCell({ label, value }) {
+  return (
+    <div style={{ flex: 1, padding: "12px 4px", textAlign: "center" }}>
+      <div className="display-font" style={{ fontSize: 20, color: MUSTARD }}>{value}</div>
+      <div style={{ fontSize: 9.5, letterSpacing: "0.12em", textTransform: "uppercase", color: "#9C9585", marginTop: 2 }}>{label}</div>
+    </div>
+  );
+}
+
+function TicketCard({ record, onDelete, onSave }) {
+  const [confirming, setConfirming] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [eAttraction, setEAttraction] = useState(record.attraction);
+  const [ePark, setEPark] = useState(record.park);
+  const [eLineType, setELineType] = useState(record.lineType);
+  const [ePostedWait, setEPostedWait] = useState(record.postedWait != null ? String(record.postedWait) : "");
+  const [eWaitMinutes, setEWaitMinutes] = useState(String(Math.round(record.waitMinutes)));
+
+  function save() {
+    onSave(record.id, {
+      attraction: eAttraction.trim() || record.attraction,
+      park: ePark.trim() || record.park,
+      lineType: eLineType,
+      postedWait: ePostedWait.trim() === "" ? null : Number(ePostedWait),
+      waitMinutes: eWaitMinutes.trim() === "" ? record.waitMinutes : Number(eWaitMinutes),
+    });
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <div style={{ background: "#FFFFFF", borderRadius: 12, border: `1.5px solid ${TEAL}`, padding: 14 }}>
+        <Field label="Ride / show"><input value={eAttraction} onChange={(e) => setEAttraction(e.target.value)} style={inputStyle} /></Field>
+        <Field label="Park"><input value={ePark} onChange={(e) => setEPark(e.target.value)} style={inputStyle} /></Field>
+        <Field label="Line type"><SegButtons options={LINE_TYPES} value={eLineType} onChange={setELineType} /></Field>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Field label="Actual wait (min)"><input type="number" value={eWaitMinutes} onChange={(e) => setEWaitMinutes(e.target.value)} style={inputStyle} /></Field>
+          <Field label="Posted wait (min)"><input type="number" value={ePostedWait} onChange={(e) => setEPostedWait(e.target.value)} placeholder="—" style={inputStyle} /></Field>
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          <button onClick={save} style={{ flex: 1, padding: "11px 0", background: TEAL, color: "#FFF", border: "none", borderRadius: 8, fontWeight: 700 }}>Save</button>
+          <button onClick={() => setEditing(false)} style={{ flex: 1, padding: "11px 0", background: "transparent", color: MUTED, border: `1.5px solid ${CREAM_LINE}`, borderRadius: 8, fontWeight: 600 }}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ background: "#FFFFFF", borderRadius: 12, border: `1px solid ${CREAM_LINE}`, display: "flex", overflow: "hidden" }}>
+      <div style={{ background: CREAM, borderRight: `2px dashed ${CREAM_LINE}`, padding: "12px 14px", minWidth: 84, textAlign: "center", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+        <div className="display-font" style={{ fontSize: 20, color: CHARCOAL, lineHeight: 1 }}>{fmtMinutes(record.waitMinutes)}</div>
+      </div>
+      <div style={{ flex: 1, padding: "12px 14px", minWidth: 0 }}>
+        <div style={{ fontWeight: 700, fontSize: 14.5, color: INK }}>{record.attraction}</div>
+        <div style={{ fontSize: 12.5, color: TEAL, fontWeight: 600, marginTop: 1 }}>{record.park}{record.land ? ` · ${record.land}` : ""}</div>
+        <div style={{ fontSize: 11.5, color: MUTED, marginTop: 4 }}>{fmtDateShort(record.date)} · {fmtTime(record.startTime)}–{fmtTime(record.endTime)}</div>
+        <div style={{ display: "flex", gap: 6, marginTop: 7, flexWrap: "wrap" }}>
+          <Badge color={lineTypeMeta(record.lineType).color} light>{lineTypeMeta(record.lineType).short}</Badge>
+          <Badge color="#9C9585" light>{record.type === "show" ? "Show" : "Ride"}</Badge>
+          {record.outcome === "left" && <Badge color="#8A5A2E">Left line</Badge>}
+          {record.brokeDown && <Badge color={CORAL}>🛠 Broke down</Badge>}
+          {record.postedWait != null && (
+            <Badge color={record.waitMinutes - record.postedWait > 0 ? CORAL : TEAL} light>
+              Posted {record.postedWait}m · {record.waitMinutes - record.postedWait >= 0 ? "+" : ""}{Math.round(record.waitMinutes - record.postedWait)}m
+            </Badge>
+          )}
+        </div>
+        {record.meetDetail && <div style={{ fontSize: 11.5, color: PLUM, marginTop: 6, fontWeight: 600 }}>Met: {record.meetDetail}</div>}
+        {record.note && <div style={{ fontSize: 11.5, color: MUTED, marginTop: 4, fontStyle: "italic" }}>"{record.note}"</div>}
+        <div style={{ display: "flex", gap: 12, marginTop: 8 }}>
+          <button onClick={() => setEditing(true)} style={{ fontSize: 11, fontWeight: 700, color: TEAL, background: "transparent", border: "none", padding: 0 }}>Edit</button>
+          {confirming ? (
+            <>
+              <button onClick={onDelete} style={{ fontSize: 11, fontWeight: 700, color: CORAL, background: "transparent", border: "none", padding: 0 }}>Confirm delete</button>
+              <button onClick={() => setConfirming(false)} style={{ fontSize: 11, color: MUTED, background: "transparent", border: "none", padding: 0 }}>Cancel</button>
+            </>
+          ) : (
+            <button onClick={() => setConfirming(true)} style={{ fontSize: 11, fontWeight: 700, color: MUTED, background: "transparent", border: "none", padding: 0 }}>Delete</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EmptyState({ title, body }) {
+  return (
+    <div style={{ textAlign: "center", padding: "60px 20px", color: MUTED }}>
+      <div className="display-font" style={{ fontSize: 24, color: "#CBBE9C", marginBottom: 6 }}>{title}</div>
+      <p style={{ fontSize: 13.5, margin: 0 }}>{body}</p>
+    </div>
+  );
+}
+
+// ============================================================
+// INSIGHTS
+// ============================================================
+function InsightsView({ records: allRecords }) {
+  const records = useMemo(() => allRecords.filter((rec) => rec.outcome !== "left"), [allRecords]);
+  if (records.length === 0) return <EmptyState title="NOTHING TO SHOW YET" body="Log a few rides and insights will appear here." />;
+
+  const byAttraction = useMemo(() => {
+    const map = new Map();
+    for (const rec of records) {
+      const key = `${rec.park}||${rec.attraction}`;
+      if (!map.has(key)) map.set(key, { attraction: rec.attraction, park: rec.park, type: rec.type, count: 0 });
+      map.get(key).count++;
+    }
+    return Array.from(map.values());
+  }, [records]);
+
+  const uniqueRides = new Set(records.filter((r2) => r2.type === "ride").map((r2) => `${r2.park}||${r2.attraction}`)).size;
+  const uniqueShows = new Set(records.filter((r2) => r2.type === "show").map((r2) => `${r2.park}||${r2.attraction}`)).size;
+  const topOverall = byAttraction.slice().sort((a, b) => b.count - a.count).slice(0, 10);
+  const byPark = useMemo(() => {
+    const map = new Map();
+    for (const item of byAttraction) {
+      if (!map.has(item.park) || map.get(item.park).count < item.count) map.set(item.park, item);
+    }
+    return Array.from(map.entries()).map(([park, top]) => ({ park, top }));
+  }, [byAttraction]);
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ display: "flex", gap: 10 }}>
+        <MetricCard label="Unique rides" value={uniqueRides} />
+        <MetricCard label="Unique shows" value={uniqueShows} />
+        <MetricCard label="Total logged" value={records.length} />
+      </div>
+      <SectionHeader>Most-ridden overall</SectionHeader>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {topOverall.map((item, i) => <RankRow key={item.park + item.attraction} rank={i + 1} title={item.attraction} subtitle={item.park} count={item.count} />)}
+      </div>
+      <SectionHeader>Your favorite at each park</SectionHeader>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {byPark.sort((a, b) => a.park.localeCompare(b.park)).map(({ park, top }) => <RankRow key={park} title={top.attraction} subtitle={park} count={top.count} />)}
+      </div>
+    </div>
+  );
+}
+
+function MetricCard({ label, value }) {
+  return (
+    <div style={{ flex: 1, background: CHARCOAL, borderRadius: 10, padding: "14px 8px", textAlign: "center" }}>
+      <div className="display-font" style={{ fontSize: 24, color: MUSTARD }}>{value}</div>
+      <div style={{ fontSize: 9.5, letterSpacing: "0.1em", textTransform: "uppercase", color: "#9C9585", marginTop: 2 }}>{label}</div>
+    </div>
+  );
+}
+function SectionHeader({ children }) {
+  return <div style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: MUTED, margin: "20px 0 8px" }}>{children}</div>;
+}
+function RankRow({ rank, title, subtitle, count }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#FFFFFF", border: `1px solid ${CREAM_LINE}`, borderRadius: 8, padding: "10px 12px" }}>
+      {rank && <div className="display-font" style={{ fontSize: 14, color: "#CBBE9C", minWidth: 18 }}>{rank}</div>}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13.5, fontWeight: 700, color: INK }}>{title}</div>
+        <div style={{ fontSize: 11.5, color: TEAL, fontWeight: 600 }}>{subtitle}</div>
+      </div>
+      <Badge color={MUSTARD} light>×{count}</Badge>
+    </div>
+  );
+}
+
+// ============================================================
+// CHALLENGES
+// ============================================================
+function ChallengesView({ challenges, records, catalog, addCustomChallenge, deleteCustomChallenge }) {
+  const [subTab, setSubTab] = useState("park");
+  const [showForm, setShowForm] = useState(false);
+  const [openId, setOpenId] = useState(null);
+
+  const progressFor = (ch) => {
+    const parkRecords = records.filter((rec) => rec.outcome !== "left" && norm(rec.park) === norm(ch.park));
+    const matchedNames = new Set(ch.attractions.filter((name) => parkRecords.some((rec) => norm(rec.attraction) === norm(name))));
+    return { matched: matchedNames.size, total: ch.attractions.length, earned: matchedNames.size >= ch.attractions.length, matchedNames };
+  };
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ display: "flex", gap: 6, marginBottom: 16, background: "#E9DCB8", borderRadius: 10, padding: 4 }}>
+        {[{ id: "park", label: "Park Challenges" }, { id: "milestones", label: "Ride Milestones" }].map((t2) => (
+          <button key={t2.id} onClick={() => setSubTab(t2.id)} style={{ flex: 1, padding: "9px 0", borderRadius: 7, border: "none", fontSize: 12.5, fontWeight: 700, background: subTab === t2.id ? CHARCOAL : "transparent", color: subTab === t2.id ? CREAM : "#5A5041" }}>
+            {t2.label}
+          </button>
+        ))}
+      </div>
+
+      {subTab === "park" ? (
+        <>
+          <button onClick={() => setShowForm((s2) => !s2)} style={{ width: "100%", padding: "13px 0", background: showForm ? "#DDD0AC" : TEAL, color: showForm ? "#5A5041" : "#FFFFFF", border: "none", borderRadius: 10, fontSize: 14, fontWeight: 700, marginBottom: 14 }}>
+            {showForm ? "Cancel" : "+ New challenge"}
+          </button>
+          {showForm && <NewChallengeForm catalog={catalog} onSave={(ch) => { addCustomChallenge(ch); setShowForm(false); }} />}
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {challenges.map((ch) => {
+              const p2 = progressFor(ch);
+              const open = openId === ch.id;
+              return (
+                <div key={ch.id} style={{ background: p2.earned ? "#FBF1DC" : "#FFFFFF", border: p2.earned ? `1.5px solid ${MUSTARD}` : `1px solid ${CREAM_LINE}`, borderRadius: 14, overflow: "hidden" }}>
+                  <button onClick={() => setOpenId(open ? null : ch.id)} style={{ width: "100%", textAlign: "left", background: "transparent", border: "none", padding: "14px 16px", display: "flex", gap: 12, alignItems: "flex-start" }}>
+                    <div style={{ fontSize: 30, filter: p2.earned ? "none" : "grayscale(1) opacity(0.4)", lineHeight: 1 }}>{ch.emoji || "🎫"}</div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                        <div style={{ fontWeight: 700, fontSize: 14.5, color: INK }}>{ch.name}</div>
+                        {p2.earned && <Badge color={MUSTARD}>Earned</Badge>}
+                      </div>
+                      <div style={{ fontSize: 12, color: TEAL, fontWeight: 600, marginTop: 1 }}>{ch.park}</div>
+                      <div style={{ fontSize: 12.5, color: "#5A5041", marginTop: 4 }}>{ch.description}</div>
+                      <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ flex: 1, height: 6, background: "#E9DCB8", borderRadius: 999, overflow: "hidden" }}>
+                          <div style={{ height: "100%", width: `${(p2.matched / p2.total) * 100}%`, background: p2.earned ? MUSTARD : TEAL, borderRadius: 999 }} />
+                        </div>
+                        <span style={{ fontSize: 11.5, color: MUTED, fontWeight: 600 }}>{p2.matched}/{p2.total}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: MUTED, marginTop: 6 }}>{open ? "Hide" : "Show"} included rides ▾</div>
+                    </div>
+                  </button>
+                  {open && (
+                    <div style={{ borderTop: `1px dashed ${CREAM_LINE}`, padding: "10px 16px 14px", display: "flex", flexDirection: "column", gap: 7 }}>
+                      {ch.attractions.map((name) => {
+                        const done = p2.matchedNames.has(name);
+                        return (
+                          <div key={name} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                            <span style={{ width: 18, height: 18, borderRadius: "50%", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, background: done ? TEAL : "#E9DCB8", color: done ? "#FFF" : "#B8AC8F", flexShrink: 0 }}>{done ? "✓" : ""}</span>
+                            <span style={{ color: done ? INK : MUTED }}>{name}</span>
+                          </div>
+                        );
+                      })}
+                      {ch.custom && <button onClick={() => deleteCustomChallenge(ch.id)} style={{ marginTop: 4, fontSize: 11, color: CORAL, background: "transparent", border: "none", padding: 0, textAlign: "left" }}>Remove challenge</button>}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <MilestonesView records={records} catalog={catalog} />
+      )}
+    </div>
+  );
+}
+
+function MilestonesView({ records, catalog }) {
+  const pairs = useMemo(() => allAttractionParkPairs(catalog, records), [catalog, records]);
+  const [park, setPark] = useState("");
+  const [attraction, setAttraction] = useState("");
+  const parkOptions = useMemo(() => Array.from(new Set(pairs.map((p2) => p2.park))).sort(), [pairs]);
+  const rideOptions = useMemo(() => pairs.filter((p2) => !park || norm(p2.park) === norm(park)).map((p2) => p2.attraction).sort(), [pairs, park]);
+  const count = useMemo(() => {
+    if (!attraction || !park) return 0;
+    return records.filter((rec) => rec.outcome !== "left" && norm(rec.attraction) === norm(attraction) && norm(rec.park) === norm(park)).length;
+  }, [records, attraction, park]);
+  const nextTier = MILESTONE_TIERS.find((t2) => t2 > count);
+
+  return (
+    <div>
+      <p style={{ fontSize: 12.5, color: "#5A5041", margin: "0 0 14px" }}>Pick a park and ride to see its full reward ladder — earned and still to come.</p>
+      <Combo label="Park" value={park} onChange={(v) => { setPark(v); setAttraction(""); }} options={parkOptions} placeholder="e.g. Disneyland Park" />
+      <Combo label="Ride or show" value={attraction} onChange={setAttraction} options={rideOptions} placeholder="e.g. Matterhorn Bobsleds" />
+      {attraction && park && (
+        <>
+          <div style={{ background: CHARCOAL, borderRadius: 14, padding: "18px 16px", textAlign: "center", marginTop: 8 }}>
+            <div style={{ fontSize: 12, color: "#9C9585", fontWeight: 600 }}>{attraction} · {park}</div>
+            <div className="display-font" style={{ fontSize: 38, color: MUSTARD, marginTop: 4 }}>{count}</div>
+            <div style={{ fontSize: 11, color: "#9C9585", textTransform: "uppercase", letterSpacing: "0.08em" }}>rides logged</div>
+            {nextTier && <div style={{ fontSize: 12, color: CREAM, marginTop: 8 }}>{nextTier - count} more to "{milestoneName(attraction, nextTier)}"</div>}
+          </div>
+          <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+            {MILESTONE_TIERS.map((tier) => {
+              const earned = count >= tier;
+              return (
+                <div key={tier} style={{ display: "flex", alignItems: "center", gap: 12, background: earned ? "#FBF1DC" : "#FFFFFF", border: earned ? `1.5px solid ${MUSTARD}` : `1px solid ${CREAM_LINE}`, borderRadius: 10, padding: "10px 14px" }}>
+                  <div style={{ fontSize: 22, filter: earned ? "none" : "grayscale(1) opacity(0.4)" }}>{TIER_EMOJI[tier]}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 700, color: INK }}>{milestoneName(attraction, tier)}</div>
+                    <div style={{ fontSize: 11, color: MUTED }}>Ride {tier.toLocaleString()} time{tier === 1 ? "" : "s"}</div>
+                  </div>
+                  {earned && <Badge color={MUSTARD}>Earned</Badge>}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function NewChallengeForm({ catalog, onSave }) {
+  const [name, setName] = useState("");
+  const [emoji, setEmoji] = useState("🎫");
+  const [park, setPark] = useState("");
+  const [description, setDescription] = useState("");
+  const [attractionDraft, setAttractionDraft] = useState("");
+  const [attractions, setAttractions] = useState([]);
+
+  const allParks = useMemo(() => {
+    const set = new Set();
+    for (const owner in catalog) for (const resort in catalog[owner]) for (const p2 in catalog[owner][resort]) set.add(p2);
+    return Array.from(set).sort();
+  }, [catalog]);
+
+  function addAttraction() {
+    const v = attractionDraft.trim();
+    if (v && !attractions.includes(v)) setAttractions([...attractions, v]);
+    setAttractionDraft("");
+  }
+  function save() {
+    if (!name.trim() || !park.trim() || attractions.length === 0) return;
+    onSave({ name: name.trim(), emoji: emoji.trim() || "🎫", park: park.trim(), description: description.trim() || `Ride everything on this list at ${park.trim()}.`, attractions });
+  }
+
+  return (
+    <div style={{ background: "#FFFFFF", border: `1px solid ${CREAM_LINE}`, borderRadius: 14, padding: 16, marginBottom: 14 }}>
+      <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ width: 70 }}><Field label="Icon"><input value={emoji} onChange={(e) => setEmoji(e.target.value)} style={{ ...inputStyle, textAlign: "center", fontSize: 22 }} /></Field></div>
+        <div style={{ flex: 1 }}><Field label="Challenge name"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. The Mountaineer" style={inputStyle} /></Field></div>
+      </div>
+      <Combo label="Park" value={park} onChange={setPark} options={allParks} placeholder="e.g. Magic Kingdom" />
+      <Field label="Description (optional)"><textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What's this challenge about?" style={{ ...inputStyle, minHeight: 60, resize: "vertical" }} /></Field>
+      <Field label="Required rides / shows">
+        <div style={{ display: "flex", gap: 6 }}>
+          <input value={attractionDraft} onChange={(e) => setAttractionDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addAttraction(); } }} placeholder="Type a name, then Add" list={`park-attractions-${park}`} style={inputStyle} />
+          <datalist id={`park-attractions-${park}`}>
+            {(() => {
+              for (const owner in catalog) for (const resort in catalog[owner]) if (catalog[owner][resort][park]) {
+                return getAllAttractionsForPark(catalog, owner, resort, park).map((a) => <option key={a.name} value={a.name} />);
+              }
+              return null;
+            })()}
+          </datalist>
+          <button onClick={addAttraction} style={{ padding: "0 16px", background: TEAL, color: "#FFF", border: "none", borderRadius: 8, fontWeight: 700, fontSize: 13.5 }}>Add</button>
+        </div>
+        {attractions.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+            {attractions.map((a) => (
+              <span key={a} style={{ display: "inline-flex", alignItems: "center", gap: 4, background: CREAM, borderRadius: 999, padding: "4px 10px", fontSize: 12 }}>
+                {a}
+                <button onClick={() => setAttractions(attractions.filter((x) => x !== a))} style={{ background: "none", border: "none", color: MUTED, cursor: "pointer", fontSize: 13 }}>×</button>
+              </span>
+            ))}
+          </div>
+        )}
+      </Field>
+      <button onClick={save} disabled={!name.trim() || !park.trim() || attractions.length === 0} style={{ width: "100%", marginTop: 4, padding: "13px 0", background: name.trim() && park.trim() && attractions.length ? CHARCOAL : "#CBBE9C", color: "#FFFFFF", border: "none", borderRadius: 8, fontSize: 14, fontWeight: 700 }}>
+        Save challenge
+      </button>
+    </div>
+  );
+}
+
+// ============================================================
+// PASSPORT
+// ============================================================
+function RideStamp({ name, type, count }) {
+  const rot = stampRotation(name);
+  const icon = stampIcon(name, type);
+  const ink = stampInk(name);
+  const pathId = `arc-${hashString(name)}`;
+  return (
+    <div style={{ transform: `rotate(${rot}deg)`, display: "flex", flexDirection: "column", alignItems: "center" }}>
+      <svg viewBox="0 0 120 120" width="96" height="96">
+        <defs>
+          <path id={pathId} d="M 14 66 A 46 46 0 1 1 106 66" fill="none" />
+        </defs>
+        <circle cx="60" cy="60" r="54" fill="none" stroke={ink} strokeWidth="3" opacity="0.85" />
+        <circle cx="60" cy="60" r="46" fill="none" stroke={ink} strokeWidth="1.5" opacity="0.55" strokeDasharray="2 3" />
+        <text fontSize="8.5" fontWeight="700" fill={ink} letterSpacing="0.5">
+          <textPath href={`#${pathId}`} startOffset="50%" textAnchor="middle">{name.toUpperCase()}</textPath>
+        </text>
+        <text x="60" y="68" fontSize="26" textAnchor="middle">{icon}</text>
+        {count > 1 && <text x="60" y="94" fontSize="9" fontWeight="700" fill={ink} textAnchor="middle">×{count}</text>}
+      </svg>
+    </div>
+  );
+}
+
+function PassportView({ records: allRecords, catalog }) {
+  const records = useMemo(() => allRecords.filter((rec) => rec.outcome !== "left"), [allRecords]);
+  const [activePark, setActivePark] = useState(null);
+
+  const byPark = useMemo(() => {
+    const map = new Map();
+    for (const rec of records) {
+      if (!map.has(rec.park)) map.set(rec.park, { park: rec.park, owner: rec.owner, resort: rec.resort, firstDate: rec.date, rides: new Map() });
+      const entry = map.get(rec.park);
+      if (rec.date < entry.firstDate) entry.firstDate = rec.date;
+      const key = norm(rec.attraction);
+      const prevCount = entry.rides.get(key)?.count || 0;
+      entry.rides.set(key, { name: rec.attraction, type: rec.type, count: prevCount + 1 });
+    }
+    return Array.from(map.values()).sort((a, b) => a.firstDate.localeCompare(b.firstDate));
+  }, [records]);
+
+  useEffect(() => {
+    if (byPark.length > 0 && !byPark.some((p2) => p2.park === activePark)) setActivePark(byPark[0].park);
+  }, [byPark]);
+
+  if (records.length === 0) return <EmptyState title="PASSPORT IS EMPTY" body="Every park you visit gets a stamp page here." />;
+
+  const current = byPark.find((p2) => p2.park === activePark) || byPark[0];
+  const known = knownAttractionCountForPark(catalog, current.owner, current.resort, current.park);
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 10 }}>
+        <span className="display-font" style={{ fontSize: 20, color: CHARCOAL }}>PASSPORT</span>
+        <span style={{ fontSize: 11, color: MUTED, fontFamily: "'JetBrains Mono', monospace", letterSpacing: "0.08em" }}>{byPark.length} park{byPark.length === 1 ? "" : "s"} stamped</span>
+      </div>
+
+      <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4, marginBottom: 4 }}>
+        {byPark.map((p2) => (
+          <button key={p2.park} onClick={() => setActivePark(p2.park)} style={{ flex: "0 0 auto", padding: "8px 14px", borderRadius: 999, border: p2.park === current.park ? `1.5px solid ${CHARCOAL}` : `1.5px solid ${CREAM_LINE}`, background: p2.park === current.park ? CHARCOAL : "#FFFFFF", color: p2.park === current.park ? CREAM : "#5A5041", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap" }}>
+            {p2.park}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ position: "relative", background: "#FBF3E1", border: `1px solid ${CREAM_LINE}`, borderRadius: 14, padding: "22px 18px 20px", boxShadow: "inset 0 0 0 1px rgba(34,28,21,0.03), 0 4px 16px rgba(34,28,21,0.08)" }}>
+        <div style={{ position: "absolute", left: 0, top: 10, bottom: 10, width: 6, background: `linear-gradient(180deg, ${CREAM_LINE}, transparent, ${CREAM_LINE})`, borderRadius: "0 4px 4px 0" }} />
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+          <div>
+            <div className="display-font" style={{ fontSize: 22, color: CHARCOAL, lineHeight: 1.1 }}>{current.park}</div>
+            <div style={{ fontSize: 12, color: TEAL, fontWeight: 600, marginTop: 3 }}>{current.owner} · {current.resort}</div>
+          </div>
+          <div style={{ border: `1.5px dashed ${BURNT_ORANGE}`, borderRadius: 8, padding: "5px 9px", textAlign: "center", transform: "rotate(-4deg)" }}>
+            <div style={{ fontSize: 8.5, color: BURNT_ORANGE, fontWeight: 700, letterSpacing: "0.08em" }}>ENTRY</div>
+            <div style={{ fontSize: 10.5, color: BURNT_ORANGE, fontWeight: 700 }}>{fmtDateShort(current.firstDate)}</div>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, justifyItems: "center" }}>
+          {Array.from(current.rides.values()).sort((a, b) => a.name.localeCompare(b.name)).map((ride) => (
+            <RideStamp key={ride.name} name={ride.name} type={ride.type} count={ride.count} />
+          ))}
+        </div>
+
+        <div style={{ marginTop: 16, textAlign: "center", fontSize: 11, color: MUTED, fontWeight: 600 }}>
+          {current.rides.size}{known ? ` / ${known}` : ""} attractions collected
+        </div>
+      </div>
+    </div>
+  );
+}
+
+  const root = ReactDOM.createRoot(document.getElementById("root"));
+  root.render(<App />);
+</script>
+</body>
+</html>
